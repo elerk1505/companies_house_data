@@ -1,0 +1,39 @@
+# ================================================================
+# .github/workflows/financials_daily.yml  — Action 1 workflow
+# ================================================================
+# Schedules at 06:00 UTC daily; you can adjust. Commits state file changes.
+# Publish/replace the half‑year Parquet asset in a GitHub Release named data-YYYY-H?-financials
+
+name: Financials Daily
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC every day
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install -U pip pandas pyarrow requests ixbrlparse
+      - name: Run daily fetch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python scripts/ixbrl_fetch_daily.py
+      - name: Commit state file
+        run: |
+          git config user.name "gh-actions"
+          git config user.email "actions@github.com"
+          git add state/financials_state.json || true
+          git commit -m "Update financials state" || echo "No changes"
+          git push || true
