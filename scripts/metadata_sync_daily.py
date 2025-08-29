@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, json, tempfile, datetime as dt
-from typing import List
+from typing import List, Dict, Any
 import pandas as pd
 from scripts.common import (gh_release_ensure, gh_release_find_asset, gh_release_download_asset,
                             gh_release_upload_or_replace_asset, append_parquet, half_from_date, tag_for_metadata)
@@ -16,30 +16,65 @@ OUTPUT_BASENAME = "metadata.parquet"
 
 META_COLUMNS = [
     'companies_house_registered_number','entity_current_legal_name','company_type','incorporation_date',
-    'sic_codes','officers','last_updated'
+    'sic_codes','officers','registered_office_postcode','registered_office_locality',
+    'company_status','last_updated'
 ]
 
-def fetch_company_meta(company_id: str) -> dict:
-    # Companies House API endpoints (simplified):
-    base = "https://api.company-information.service.gov.uk/company/"
-    meta = {}
-    r = SESS.get(base + company_id, timeout=60)
-    if r.ok:
+API_BASE = "https://api.company-information.service.gov.uk"
+
+
+def fetch_company_profile(company_id: str) -> Dict[str, Any]:
+    r = SESS.get(f"{API_BASE}/company/{company_id}", timeout=60)
+    r.raise_for_status()
+    j = r.json()
+    out: Dict[str, Any] = {
+        'companies_house_registered_number': company_id,
+        'entity_current_legal_name': j.get('company_name'),
+        'company_type': j.get('type'),
+        'incorporation_date': j.get('date_of_creation'),
+        'sic_codes': j.get('sic_codes', []),
+        'company_status': j.get('company_status'),
+    }
+    roa = j.get('registered_office_address') or {}
+    out['registered_office_postcode'] = roa.get('postal_code')
+    out['registered_office_locality'] = roa.get('locality')
+    return out
+
+
+def fetch_officers(company_id: str) -> List[str]:
+    r = SESS.get(f"{API_BASE}/company/{company_id}/officers", timeout=60, params={"items_per_page": 100})
+    if not r.ok:
+        return []
+    j = r.json()
+    return [x.get('name') for x in j.get('items', []) if x.get('name')]
+
+
+def fetch_advanced_enrichment(company_id: str, company_name: str | None) -> Dict[str, Any]:
+    """Use Advanced Search to enrich fields like address and confirm SIC; match by company_number."""
+    if not company_name:
+        return {}
+    params = {
+        "company_name_includes": company_name,
+        "size": 100,
+        "start_index": 0,
+    }
+    try:
+        r = SESS.get(f"{API_BASE}/advanced-search/companies", params=params, timeout=60)
+        if not r.ok:
+            return {}
         j = r.json()
-        meta.update({
-            'companies_house_registered_number': company_id,
-            'entity_current_legal_name': j.get('company_name'),
-            'company_type': j.get('type'),
-            'incorporation_date': j.get('date_of_creation'),
-            'sic_codes': j.get('sic_codes', []),
-        })
-    # officers
-    ro = SESS.get(base + company_id + "/officers", timeout=60)
-    if ro.ok:
-        jj = ro.json()
-        meta['officers'] = [x.get('name') for x in jj.get('items', [])]
-    meta['last_updated'] = dt.datetime.utcnow().isoformat()
-    return meta
+        for it in j.get('items', []):
+            if it.get('company_number') == company_id:
+                ro = it.get('registered_office_address') or {}
+                return {
+                    'registered_office_postcode': ro.get('postal_code'),
+                    'registered_office_locality': ro.get('locality'),
+                    'sic_codes': it.get('sic_codes') or None,
+                    'company_status': it.get('company_status') or None,
+                }
+    except Exception:
+        return {}
+    return {}
 
 
 def main():
@@ -48,19 +83,15 @@ def main():
     if os.path.exists(STATE_PATH):
         state = json.load(open(STATE_PATH, "r", encoding="utf-8"))
 
-    # Strategy: iterate over financials releases for the last 7 days halves; collect new IDs
     today = dt.date.today()
-    halves = set()
-    for delta in range(0, 8):
-        d = today - dt.timedelta(days=delta)
-        halves.add((d.year, 'H1' if d.month <= 6 else 'H2'))
+    halves = {(d.year, 'H1' if d.month <= 6 else 'H2') for d in [today - dt.timedelta(days=i) for i in range(0, 8)]}
 
-    all_new_ids = set()
+    all_new_ids: set[str] = set()
     for year, half in sorted(halves):
         fin_tag = f"data-{year}-{half}-financials"
         fin_rel = gh_release_ensure(fin_tag)
         asset = gh_release_find_asset(fin_rel, "financials.parquet")
-        if not asset: 
+        if not asset:
             continue
         tmp_fin = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
         gh_release_download_asset(asset, tmp_fin)
@@ -74,12 +105,15 @@ def main():
         json.dump(state, open(STATE_PATH, "w", encoding="utf-8"), indent=2)
         return
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for cid in sorted(all_new_ids):
         try:
-            meta = fetch_company_meta(cid)
-            if meta.get('companies_house_registered_number'):
-                rows.append(meta)
+            base = fetch_company_profile(cid)
+            base['officers'] = fetch_officers(cid)
+            adv = fetch_advanced_enrichment(cid, base.get('entity_current_legal_name'))
+            base.update({k: v for k, v in adv.items() if v is not None})
+            base['last_updated'] = dt.datetime.utcnow().isoformat()
+            rows.append(base)
         except Exception:
             continue
 
@@ -88,7 +122,6 @@ def main():
 
     df = pd.DataFrame(rows, columns=META_COLUMNS)
 
-    # Choose half by incorporation_date if present, else current date
     if df['incorporation_date'].notna().any():
         dd = pd.to_datetime(df['incorporation_date'], errors='coerce').dropna()
         ref_date = dd.iloc[0].date()
