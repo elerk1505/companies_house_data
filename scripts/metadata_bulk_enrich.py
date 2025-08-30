@@ -1,16 +1,17 @@
 # ================================================================
-# scripts/metadata_bulk_enrich.py — Action 4 (Bulk Metadata, no officers)
+# scripts/metadata_bulk_from_snapshot.py
+# Build metadata from Companies House "Basic Company Data" snapshot
+# and append it to data-YYYY-H?-metadata/metadata.parquet
 # ================================================================
 from __future__ import annotations
 
-import os
 import io
-import json
-import time
+import os
+import zipfile
 import tempfile
 import argparse
 import datetime as dt
-from typing import Any, Dict, List, Set
+from typing import Dict, List
 
 import pandas as pd
 import requests
@@ -23,91 +24,157 @@ from scripts.common import (
     append_parquet,
 )
 
-API_BASE = "https://api.company-information.service.gov.uk"
 OUTPUT_BASENAME = "metadata.parquet"
-CH_API_KEY = os.getenv("CH_API_KEY", "")
 
-# ---------- HTTP session ----------
-SESS = requests.Session()
-SESS.headers.update({"User-Agent": "Allosaurus/1.0"})
-if CH_API_KEY:
-    SESS.auth = (CH_API_KEY, "")
+# Map snapshot column names -> our unified schema
+SNAP_TO_OURS: Dict[str, str] = {
+    # Core identifiers
+    "CompanyNumber": "companies_house_registered_number",
+    "CompanyName": "entity_current_legal_name",
+    "CompanyCategory": "company_type",
+    "CompanyStatus": "company_status",
+    "CountryOfOrigin": "country_of_origin",
+    "IncorporationDate": "incorporation_date",
+    "DissolutionDate": "dissolution_date",
+    "URI": "uri",
+    # Registered office (full address detail)
+    "RegAddress.CareOf": "registered_office_care_of",
+    "RegAddress.POBox": "registered_office_po_box",
+    "RegAddress.AddressLine1": "registered_office_address_line_1",
+    "RegAddress.AddressLine2": "registered_office_address_line_2",
+    "RegAddress.AddressLine3": "registered_office_address_line_3",
+    "RegAddress.AddressLine4": "registered_office_address_line_4",
+    "RegAddress.PostTown": "registered_office_post_town",
+    "RegAddress.County": "registered_office_county",
+    "RegAddress.Country": "registered_office_country",
+    "RegAddress.PostCode": "registered_office_postcode",
+    # Accounts / Returns / Confirmation statement
+    "Accounts.AccountRefDay": "accounts_ref_day",
+    "Accounts.AccountRefMonth": "accounts_ref_month",
+    "Accounts.NextDueDate": "accounts_next_due_date",
+    "Accounts.LastMadeUpDate": "accounts_last_made_up_date",
+    "Returns.NextDueDate": "returns_next_due_date",
+    "Returns.LastMadeUpDate": "returns_last_made_up_date",
+    "ConfStmtNextDueDate": "conf_stmt_next_due_date",
+    "ConfStmtLastMadeUpDate": "conf_stmt_last_made_up_date",
+    # Mortgages
+    "Mortgages.NumMortCharges": "mortgages_num_charges",
+    "Mortgages.NumMortOutstanding": "mortgages_num_outstanding",
+    "Mortgages.NumMortPartSatisfied": "mortgages_num_part_satisfied",
+    "Mortgages.NumMortSatisfied": "mortgages_num_satisfied",
+    # SIC text columns (we’ll compress to list)
+    "SICCode.SicText_1": "sic1",
+    "SICCode.SicText_2": "sic2",
+    "SICCode.SicText_3": "sic3",
+    "SICCode.SicText_4": "sic4",
+}
 
-def _req(url: str, **kw) -> requests.Response:
-    """GET with soft backoff for 429s."""
-    for attempt in range(5):
-        r = SESS.get(url, timeout=60, **kw)
-        if r.status_code != 429:
-            return r
-        wait = 2 * (attempt + 1)
-        print(f"[rate] 429 {url} — sleeping {wait}s")
-        time.sleep(wait)
-    return r
-
-# ---------- API helpers ----------
-def fetch_company_profile(company_id: str) -> Dict[str, Any]:
-    r = _req(f"{API_BASE}/company/{company_id}")
-    r.raise_for_status()
-    j = r.json()
-    roa = j.get("registered_office_address") or {}
-    return {
-        "companies_house_registered_number": company_id,
-        "entity_current_legal_name": j.get("company_name"),
-        "company_type": j.get("type"),
-        "company_status": j.get("company_status"),
-        "incorporation_date": j.get("date_of_creation"),
-        "sic_codes": j.get("sic_codes", []),
-        "registered_office_postcode": roa.get("postal_code"),
-        "registered_office_locality": roa.get("locality"),
-    }
-
-def fetch_advanced_enrichment(company_id: str, company_name: str | None) -> Dict[str, Any]:
-    if not company_name:
-        return {}
-    params = {"company_name_includes": company_name, "size": 100, "start_index": 0}
-    try:
-        r = _req(f"{API_BASE}/advanced-search/companies", params=params)
-        if not r.ok:
-            return {}
-        j = r.json()
-        for it in j.get("items", []):
-            if it.get("company_number") == company_id:
-                ro = it.get("registered_office_address") or {}
-                out = {
-                    "registered_office_postcode": ro.get("postal_code"),
-                    "registered_office_locality": ro.get("locality"),
-                    "company_status": it.get("company_status") or None,
-                }
-                if it.get("sic_codes"):
-                    out["sic_codes"] = it.get("sic_codes")
-                return out
-    except Exception:
-        return {}
-    return {}
-
-# ---------- Schema ----------
-META_COLUMNS = [
+# Final column order we write to the parquet
+META_COLUMNS: List[str] = [
     "companies_house_registered_number",
     "entity_current_legal_name",
     "company_type",
     "company_status",
+    "country_of_origin",
     "incorporation_date",
+    "dissolution_date",
     "sic_codes",
+    # Registered office (full)
+    "registered_office_care_of",
+    "registered_office_po_box",
+    "registered_office_address_line_1",
+    "registered_office_address_line_2",
+    "registered_office_address_line_3",
+    "registered_office_address_line_4",
+    "registered_office_post_town",
+    "registered_office_county",
+    "registered_office_country",
     "registered_office_postcode",
-    "registered_office_locality",
+    # Accounts
+    "accounts_ref_day",
+    "accounts_ref_month",
+    "accounts_next_due_date",
+    "accounts_last_made_up_date",
+    # Returns / Confirmation statement
+    "returns_next_due_date",
+    "returns_last_made_up_date",
+    "conf_stmt_next_due_date",
+    "conf_stmt_last_made_up_date",
+    # Mortgages
+    "mortgages_num_charges",
+    "mortgages_num_outstanding",
+    "mortgages_num_part_satisfied",
+    "mortgages_num_satisfied",
+    # Misc
+    "uri",
     "last_updated",
 ]
 
-# ---------- Main ----------
+
+def load_snapshot_df(snapshot_url: str) -> pd.DataFrame:
+    """
+    Download the 'Basic Company Data' monthly ZIP and return its CSV as a DataFrame.
+    We load as strings to preserve leading zeros and later coerce dates explicitly.
+    """
+    r = requests.get(snapshot_url, timeout=600)
+    r.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise RuntimeError("No CSV file found in snapshot ZIP.")
+        with z.open(csv_names[0]) as f:
+            df = pd.read_csv(f, dtype=str)
+    return df
+
+
+def to_metadata_schema(snap: pd.DataFrame) -> pd.DataFrame:
+    # Keep only columns we know and rename to our schema
+    keep = {src: dst for src, dst in SNAP_TO_OURS.items() if src in snap.columns}
+    df = snap[list(keep.keys())].rename(columns=keep)
+
+    # Build SIC list
+    sic_cols = [c for c in ["sic1", "sic2", "sic3", "sic4"] if c in df.columns]
+    if sic_cols:
+        def pack_sic(row):
+            vals = [str(row[c]).strip() for c in sic_cols if pd.notna(row[c]) and str(row[c]).strip()]
+            return vals if vals else None
+        df["sic_codes"] = df.apply(pack_sic, axis=1)
+        df.drop(columns=[c for c in sic_cols if c in df.columns], inplace=True)
+    else:
+        df["sic_codes"] = None
+
+    # Coerce date-like strings
+    for c in [
+        "incorporation_date", "dissolution_date",
+        "accounts_next_due_date", "accounts_last_made_up_date",
+        "returns_next_due_date", "returns_last_made_up_date",
+        "conf_stmt_next_due_date", "conf_stmt_last_made_up_date",
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    # Ensure all final columns exist
+    for c in META_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # Keep final order
+    return df[META_COLUMNS]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--year", type=int, required=True)
-    ap.add_argument("--half", type=str, required=True, choices=["H1", "H2"])
-    ap.add_argument("--refresh", action="store_true")
-    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--year", type=int, required=True, help="Target year (e.g., 2025)")
+    ap.add_argument("--half", type=str, required=True, choices=["H1", "H2"], help="Target half")
+    ap.add_argument(
+        "--snapshot-url",
+        type=str,
+        required=True,
+        help="URL to the Basic Company Data monthly ZIP (Free Company Data Product)",
+    )
     args = ap.parse_args()
 
-    # 1) Load company IDs from financials release
+    # 1) Load company IDs from the financials release for the chosen half
     fin_tag = f"data-{args.year}-{args.half}-financials"
     fin_rel = gh_release_ensure(fin_tag)
     fin_asset = gh_release_find_asset(fin_rel, "financials.parquet")
@@ -115,62 +182,49 @@ def main():
         print(f"[error] no financials.parquet in {fin_tag}")
         return
 
-    fin_tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
-    gh_release_download_asset(fin_asset, fin_tmp)
-    fin_df = pd.read_parquet(fin_tmp, columns=["companies_house_registered_number"])
-    all_ids = fin_df["companies_house_registered_number"].astype(str).dropna().unique().tolist()
-    print(f"[info] found {len(all_ids)} company IDs in {fin_tag}")
+    tmp_fin = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
+    gh_release_download_asset(fin_asset, tmp_fin)
+    fin_ids = (
+        pd.read_parquet(tmp_fin, columns=["companies_house_registered_number"])
+        ["companies_house_registered_number"]
+        .astype(str).dropna().unique()
+    )
+    fin_ids_set = set(fin_ids)
+    print(f"[info] found {len(fin_ids_set)} company IDs in {fin_tag}")
 
-    # 2) Prepare metadata release
+    # 2) Download + load the monthly snapshot once
+    print(f"[info] downloading snapshot: {args.snapshot_url}")
+    snap_raw = load_snapshot_df(args.snapshot_url)
+    print(f"[info] snapshot rows: {len(snap_raw):,}")
+
+    # 3) Map to our schema and filter to only IDs present in financials
+    meta = to_metadata_schema(snap_raw)
+    before = len(meta)
+    meta = meta[meta["companies_house_registered_number"].isin(fin_ids_set)]
+    after = len(meta)
+    print(f"[info] matched to financials: {after:,} / {before:,} rows")
+
+    if after == 0:
+        print("[warn] no matching rows; nothing to append")
+        return
+
+    # Stamp last_updated
+    meta["last_updated"] = pd.Timestamp.utcnow().isoformat()
+
+    # 4) Append (dedupe by company id) into data-YYYY-H?-metadata/metadata.parquet
     meta_tag = f"data-{args.year}-{args.half}-metadata"
     meta_rel = gh_release_ensure(meta_tag, name=f"Metadata {args.year} {args.half}")
-    meta_tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
-    existing_ids: Set[str] = set()
 
-    meta_asset = gh_release_find_asset(meta_rel, OUTPUT_BASENAME)
-    if meta_asset and not args.refresh:
-        gh_release_download_asset(meta_asset, meta_tmp)
-        try:
-            meta_df = pd.read_parquet(meta_tmp, columns=["companies_house_registered_number"])
-            existing_ids = set(meta_df["companies_house_registered_number"].astype(str).dropna().unique())
-            print(f"[info] existing metadata rows: {len(existing_ids)} (will skip)")
-        except Exception:
-            pass
+    tmp_out = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
+    asset = gh_release_find_asset(meta_rel, OUTPUT_BASENAME)
+    if asset:
+        gh_release_download_asset(asset, tmp_out)
 
-    ids = [cid for cid in all_ids if args.refresh or cid not in existing_ids]
-    if args.limit > 0:
-        ids = ids[: args.limit]
-    if not ids:
-        print("[info] nothing to do")
-        return
+    append_parquet(tmp_out, meta, subset_keys=["companies_house_registered_number"])
+    gh_release_upload_or_replace_asset(meta_rel, tmp_out, name=OUTPUT_BASENAME)
 
-    print(f"[info] enriching {len(ids)} companies (no officers)")
+    print(f"[ok] snapshot merged → {meta_tag} (+{after} rows)")
 
-    rows: List[Dict[str, Any]] = []
-    for i, cid in enumerate(ids, 1):
-        try:
-            base = fetch_company_profile(cid)
-            adv = fetch_advanced_enrichment(cid, base.get("entity_current_legal_name"))
-            base.update({k: v for k, v in adv.items() if v is not None})
-            base["last_updated"] = dt.datetime.utcnow().isoformat()
-            rows.append(base)
-        except Exception as e:
-            print(f"[warn] {cid}: {e}")
-        if i % 200 == 0:
-            print(f"[info] progress {i}/{len(ids)}")
-
-    if not rows:
-        print("[warn] no metadata rows")
-        return
-
-    out_df = pd.DataFrame(rows, columns=META_COLUMNS)
-
-    if meta_asset and not args.refresh:
-        gh_release_download_asset(meta_asset, meta_tmp)
-    append_parquet(meta_tmp, out_df, subset_keys=["companies_house_registered_number"])
-    gh_release_upload_or_replace_asset(meta_rel, meta_tmp, name=OUTPUT_BASENAME)
-
-    print(f"[ok] metadata updated: {meta_tag} (rows added: {len(out_df)})")
 
 if __name__ == "__main__":
     main()
