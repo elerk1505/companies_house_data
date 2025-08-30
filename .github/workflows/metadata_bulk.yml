@@ -1,3 +1,4 @@
+# .github/workflows/metadata_bulk.yml
 name: Metadata API Fill
 
 on:
@@ -6,7 +7,7 @@ on:
       year:
         description: "Year (e.g. 2025)"
         required: true
-        type: number
+        type: string
       half:
         description: "Half"
         required: true
@@ -15,15 +16,18 @@ on:
       max_rpm:
         description: "Max requests per minute (safe 8–15)"
         required: false
-        type: number
+        type: string
+        default: "10"
       batch_size:
         description: "Checkpoint every N rows"
         required: false
-        type: number
+        type: string
+        default: "300"
       limit:
         description: "Optional cap for testing"
         required: false
-        type: number
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -36,18 +40,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install deps
         run: python -m pip install -U pip pandas pyarrow requests
+
       - name: API fill missing metadata
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
+          # if max_rpm is empty, leave it unset — script falls back to 10
           CH_MAX_RPM: ${{ inputs.max_rpm }}
+        shell: bash
         run: |
+          EXTRA=""
+          if [ -n "${{ inputs.limit }}" ]; then
+            EXTRA="--limit ${{ inputs.limit }}"
+          fi
+
           python -m scripts.metadata_bulk_api_fill \
-            --year ${{ inputs.year }} \
-            --half ${{ inputs.half }} \
-            ${{ inputs.batch_size && format('--batch-size {0}', inputs.batch_size) || '' }} \
-            ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+            --year "${{ inputs.year }}" \
+            --half "${{ inputs.half }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            $EXTRA
