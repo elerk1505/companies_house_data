@@ -1,0 +1,37 @@
+name: Financials Bulk
+
+on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Year (e.g. 2025)"
+        required: true
+        type: number
+      months:
+        description: "Comma months (e.g. 1,2,3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip pandas pyarrow requests ixbrlparse
+
+      - name: Bulk parse & append
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m scripts.ixbrl_bulk_parse --year ${{ inputs.year }} --months "${{ inputs.months }}"
