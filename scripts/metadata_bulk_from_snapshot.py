@@ -2,11 +2,11 @@
 # scripts/metadata_bulk_from_snapshot.py
 # Build metadata from Companies House "Basic Company Data" snapshot
 # and append it to data-YYYY-H?-metadata/metadata.parquet
+# ID matching is aligned to your iXBRL outputs: digits-only, no leading zeros.
 # ================================================================
 from __future__ import annotations
 
 import io
-import os
 import zipfile
 import tempfile
 import argparse
@@ -110,6 +110,21 @@ META_COLUMNS: List[str] = [
     "last_updated",
 ]
 
+# ---------- ID normalisation to match your iXBRL outputs ----------
+def normalize_to_ixbrl_format(x):
+    """
+    Match your financials 'company_id' style:
+    - keep digits only
+    - strip leading zeros
+    - return None if nothing left
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = "".join(ch for ch in str(x).strip() if ch.isdigit())
+    s = s.lstrip("0")
+    return s or None
+
+# ---------- Snapshot helpers ----------
 def onefile_url(year: int, month: int) -> str:
     """Single-file snapshot URL (always dated on the 1st)."""
     return f"https://download.companieshouse.gov.uk/BasicCompanyDataAsOneFile-{year}-{month:02d}-01.zip"
@@ -144,7 +159,7 @@ def to_metadata_schema(snap: pd.DataFrame) -> pd.DataFrame:
     else:
         df["sic_codes"] = None
 
-    # Coerce date-like strings
+    # Coerce date-like strings (silently ignore bad formats)
     for c in [
         "incorporation_date", "dissolution_date",
         "accounts_next_due_date", "accounts_last_made_up_date",
@@ -162,6 +177,7 @@ def to_metadata_schema(snap: pd.DataFrame) -> pd.DataFrame:
     # Keep final order
     return df[META_COLUMNS]
 
+# ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year", type=int, required=True, help="Target year (e.g., 2025)")
@@ -183,10 +199,13 @@ def main():
 
     print(f"[info] snapshot rows: {len(snap_raw):,}")
 
-    # Map to our schema
+    # Map to our schema and NORMALIZE IDs to match your iXBRL format
     meta = to_metadata_schema(snap_raw)
+    meta["companies_house_registered_number"] = meta[
+        "companies_house_registered_number"
+    ].map(normalize_to_ixbrl_format)
 
-    # 1) Load company IDs from the financials release for the chosen half (to match/trim)
+    # 1) Load company IDs from the financials release for the chosen half
     fin_tag = f"data-{args.year}-{args.half}-financials"
     fin_rel = gh_release_ensure(fin_tag)
     fin_asset = gh_release_find_asset(fin_rel, "financials.parquet")
@@ -199,11 +218,14 @@ def main():
     fin_ids = (
         pd.read_parquet(tmp_fin, columns=["companies_house_registered_number"])
         ["companies_house_registered_number"]
-        .astype(str).dropna().unique()
+        .map(normalize_to_ixbrl_format)
+        .dropna()
+        .unique()
     )
     fin_ids_set = set(fin_ids)
     print(f"[info] found {len(fin_ids_set)} company IDs in {fin_tag}")
 
+    # 2) Filter snapshot to only IDs present in financials (post-normalisation)
     before = len(meta)
     meta = meta[meta["companies_house_registered_number"].isin(fin_ids_set)]
     after = len(meta)
@@ -216,7 +238,7 @@ def main():
     # Stamp last_updated
     meta["last_updated"] = pd.Timestamp.utcnow().isoformat()
 
-    # 2) Append (dedupe by company id) into data-YYYY-H?-metadata/metadata.parquet
+    # 3) Append (dedupe by company id) into data-YYYY-H?-metadata/metadata.parquet
     meta_tag = f"data-{args.year}-{args.half}-metadata"
     meta_rel = gh_release_ensure(meta_tag, name=f"Metadata {args.year} {args.half}")
 
