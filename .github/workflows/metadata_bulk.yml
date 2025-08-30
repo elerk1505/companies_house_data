@@ -7,15 +7,15 @@ on:
         description: "Year (e.g. 2025)"
         required: true
         type: number
+      month:
+        description: "Month (1–12)"
+        required: true
+        type: number
       half:
         description: "Half (H1 or H2)"
         required: true
         type: choice
         options: [H1, H2]
-      snapshot_url:
-        description: "URL to 'Basic Company Data' monthly ZIP (Free Company Data Product)"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -26,12 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
 
       - name: Install deps
-        run: |
-          python -m pip install -U pip pandas pyarrow requests
+        run: python -m pip install -U pip pandas pyarrow requests
 
       - name: Build metadata from snapshot
         env:
@@ -41,5 +39,5 @@ jobs:
         run: |
           python -m scripts.metadata_bulk_from_snapshot \
             --year ${{ inputs.year }} \
-            --half ${{ inputs.half }} \
-            --snapshot-url "${{ inputs.snapshot_url }}"
+            --month ${{ inputs.month }} \
+            --half ${{ inputs.half }}
