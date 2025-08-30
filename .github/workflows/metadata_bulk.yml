@@ -1,4 +1,4 @@
-name: Metadata Bulk
+name: Metadata from Snapshot
 
 on:
   workflow_dispatch:
@@ -12,14 +12,10 @@ on:
         required: true
         type: choice
         options: [H1, H2]
-      refresh:
-        description: "Refetch all (ignore existing metadata asset)"
-        required: false
-        type: boolean
-      limit:
-        description: "Optional cap on number of companies (testing)"
-        required: false
-        type: number
+      snapshot_url:
+        description: "URL to 'Basic Company Data' monthly ZIP (Free Company Data Product)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -37,15 +33,13 @@ jobs:
         run: |
           python -m pip install -U pip pandas pyarrow requests
 
-      - name: Bulk metadata enrich
+      - name: Build metadata from snapshot
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m scripts.metadata_bulk_enrich \
+          python -m scripts.metadata_bulk_from_snapshot \
             --year ${{ inputs.year }} \
             --half ${{ inputs.half }} \
-            ${{ inputs.refresh && '--refresh' || '' }} \
-            ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+            --snapshot-url "${{ inputs.snapshot_url }}"
