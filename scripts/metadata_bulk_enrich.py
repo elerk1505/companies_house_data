@@ -110,13 +110,15 @@ META_COLUMNS: List[str] = [
     "last_updated",
 ]
 
+def onefile_url(year: int, month: int) -> str:
+    """Single-file snapshot URL (always dated on the 1st)."""
+    return f"https://download.companieshouse.gov.uk/BasicCompanyDataAsOneFile-{year}-{month:02d}-01.zip"
 
-def load_snapshot_df(snapshot_url: str) -> pd.DataFrame:
-    """
-    Download the 'Basic Company Data' monthly ZIP and return its CSV as a DataFrame.
-    We load as strings to preserve leading zeros and later coerce dates explicitly.
-    """
-    r = requests.get(snapshot_url, timeout=600)
+def load_snapshot_df(url: str) -> pd.DataFrame:
+    """Download the monthly ZIP and return its CSV as a DataFrame (all strings)."""
+    r = requests.get(url, timeout=600)
+    if r.status_code == 404:
+        raise FileNotFoundError(url)
     r.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
@@ -125,7 +127,6 @@ def load_snapshot_df(snapshot_url: str) -> pd.DataFrame:
         with z.open(csv_names[0]) as f:
             df = pd.read_csv(f, dtype=str)
     return df
-
 
 def to_metadata_schema(snap: pd.DataFrame) -> pd.DataFrame:
     # Keep only columns we know and rename to our schema
@@ -161,20 +162,31 @@ def to_metadata_schema(snap: pd.DataFrame) -> pd.DataFrame:
     # Keep final order
     return df[META_COLUMNS]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year", type=int, required=True, help="Target year (e.g., 2025)")
+    ap.add_argument("--month", type=int, required=True, help="Snapshot month (1–12)")
     ap.add_argument("--half", type=str, required=True, choices=["H1", "H2"], help="Target half")
-    ap.add_argument(
-        "--snapshot-url",
-        type=str,
-        required=True,
-        help="URL to the Basic Company Data monthly ZIP (Free Company Data Product)",
-    )
     args = ap.parse_args()
 
-    # 1) Load company IDs from the financials release for the chosen half
+    # Build URL; auto-fallback to previous month if the chosen one isn't published yet
+    url = onefile_url(args.year, args.month)
+    try:
+        print(f"[info] downloading snapshot: {url}")
+        snap_raw = load_snapshot_df(url)
+    except FileNotFoundError:
+        # previous month
+        d = dt.date(args.year, args.month, 1) - dt.timedelta(days=1)
+        url_prev = onefile_url(d.year, d.month)
+        print(f"[warn] snapshot not found, trying previous month: {url_prev}")
+        snap_raw = load_snapshot_df(url_prev)
+
+    print(f"[info] snapshot rows: {len(snap_raw):,}")
+
+    # Map to our schema
+    meta = to_metadata_schema(snap_raw)
+
+    # 1) Load company IDs from the financials release for the chosen half (to match/trim)
     fin_tag = f"data-{args.year}-{args.half}-financials"
     fin_rel = gh_release_ensure(fin_tag)
     fin_asset = gh_release_find_asset(fin_rel, "financials.parquet")
@@ -192,13 +204,6 @@ def main():
     fin_ids_set = set(fin_ids)
     print(f"[info] found {len(fin_ids_set)} company IDs in {fin_tag}")
 
-    # 2) Download + load the monthly snapshot once
-    print(f"[info] downloading snapshot: {args.snapshot_url}")
-    snap_raw = load_snapshot_df(args.snapshot_url)
-    print(f"[info] snapshot rows: {len(snap_raw):,}")
-
-    # 3) Map to our schema and filter to only IDs present in financials
-    meta = to_metadata_schema(snap_raw)
     before = len(meta)
     meta = meta[meta["companies_house_registered_number"].isin(fin_ids_set)]
     after = len(meta)
@@ -211,7 +216,7 @@ def main():
     # Stamp last_updated
     meta["last_updated"] = pd.Timestamp.utcnow().isoformat()
 
-    # 4) Append (dedupe by company id) into data-YYYY-H?-metadata/metadata.parquet
+    # 2) Append (dedupe by company id) into data-YYYY-H?-metadata/metadata.parquet
     meta_tag = f"data-{args.year}-{args.half}-metadata"
     meta_rel = gh_release_ensure(meta_tag, name=f"Metadata {args.year} {args.half}")
 
@@ -224,7 +229,6 @@ def main():
     gh_release_upload_or_replace_asset(meta_rel, tmp_out, name=OUTPUT_BASENAME)
 
     print(f"[ok] snapshot merged → {meta_tag} (+{after} rows)")
-
 
 if __name__ == "__main__":
     main()
