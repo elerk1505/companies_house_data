@@ -6,27 +6,28 @@ on:
   workflow_dispatch:
     inputs:
       year:
-        description: "Year (defaults to current if blank)"
+        description: "Year (blank = current)"
         required: false
         type: string
         default: ""
       half:
-        description: "Half (if set, overrides matrix)"
+        description: "Half (leave blank to run both)"
         required: false
         type: choice
         options: [H1, H2]
+        default: ""
       limit:
-        description: "API cap per run (default 1500)"
+        description: "API cap per run"
         required: false
         type: string
         default: "1500"
       max_rpm:
-        description: "Max requests per minute (safe 8–15; default 10)"
+        description: "Max requests/min (8–15)"
         required: false
         type: string
         default: "10"
       batch_size:
-        description: "Checkpoint every N rows (default 300)"
+        description: "Checkpoint size"
         required: false
         type: string
         default: "300"
@@ -35,40 +36,93 @@ permissions:
   contents: write
 
 jobs:
-  refresh:
+  # ---- Scheduled: always run both halves via matrix ----
+  scheduled:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         half: [H1, H2]
-    # If the user manually selects a half, only run that one
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.half == '' || matrix.half == inputs.half }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install deps
         run: python -m pip install -U pip pandas pyarrow requests
+      - name: Snapshot + API refresh (scheduled)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          CH_API_KEY: ${{ secrets.CH_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
+          CH_MAX_RPM: "10"
+        run: |
+          python -m scripts.metadata_snapshot_and_fill \
+            --half "${{ matrix.half }}" \
+            --limit "1500" \
+            --batch-size "300" \
+            --max-rpm "10"
 
-      - name: Snapshot + API refresh
+  # ---- Manual: run exactly one half if user chose one ----
+  manual_single:
+    if: github.event_name == 'workflow_dispatch' && inputs.half != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: python -m pip install -U pip pandas pyarrow requests
+      - name: Snapshot + API refresh (manual single)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
           CH_MAX_RPM: ${{ inputs.max_rpm || '10' }}
-        shell: bash
         run: |
           YEAR_ARG=""
           if [ -n "${{ inputs.year }}" ]; then
             YEAR_ARG="--year ${{ inputs.year }}"
           fi
-
           python -m scripts.metadata_snapshot_and_fill \
             $YEAR_ARG \
-            --half "${{ inputs.half || matrix.half }}" \
+            --half "${{ inputs.half }}" \
+            --limit "${{ inputs.limit || '1500' }}" \
+            --batch-size "${{ inputs.batch_size || '300' }}" \
+            --max-rpm "${{ inputs.max_rpm || '10' }}"
+
+  # ---- Manual: if user left half blank, run both halves via matrix ----
+  manual_both:
+    if: github.event_name == 'workflow_dispatch' && inputs.half == ''
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        half: [H1, H2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: python -m pip install -U pip pandas pyarrow requests
+      - name: Snapshot + API refresh (manual both)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          CH_API_KEY: ${{ secrets.CH_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
+          CH_MAX_RPM: ${{ inputs.max_rpm || '10' }}
+        run: |
+          YEAR_ARG=""
+          if [ -n "${{ inputs.year }}" ]; then
+            YEAR_ARG="--year ${{ inputs.year }}"
+          fi
+          python -m scripts.metadata_snapshot_and_fill \
+            $YEAR_ARG \
+            --half "${{ matrix.half }}" \
             --limit "${{ inputs.limit || '1500' }}" \
             --batch-size "${{ inputs.batch_size || '300' }}" \
             --max-rpm "${{ inputs.max_rpm || '10' }}"
