@@ -1,94 +1,66 @@
-name: Metadata Refresh (Snapshot + API)
+# .github/workflows/metadata_bulk.yml
+name: Metadata API Fill
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
   workflow_dispatch:
     inputs:
       year:
-        description: "Year (defaults to current if blank)"
-        required: false
+        description: "Year (e.g. 2025)"
+        required: true
         type: string
-        default: ""
       half:
-        description: "Half (if set, run only that half)"
-        required: false
+        description: "Half"
+        required: true
         type: choice
         options: [H1, H2]
-        default: ""
-      limit:
-        description: "API cap per run (default 1500)"
-        required: false
-        type: string
-        default: "1500"
       max_rpm:
-        description: "Max requests per minute (safe 8–15; default 10)"
+        description: "Max requests per minute (safe 8–15)"
         required: false
         type: string
         default: "10"
       batch_size:
-        description: "Checkpoint every N rows (default 300)"
+        description: "Checkpoint every N rows"
         required: false
         type: string
         default: "300"
+      limit:
+        description: "Optional cap for testing"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
-  scheduled:
-    if: github.event_name == 'schedule'
+  run:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        half: [H1, H2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install deps
-        run: python -m pip install -U pip pandas pyarrow requests
-      - name: Snapshot + API refresh (scheduled)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          CH_API_KEY: ${{ secrets.CH_API_KEY }}
-          PYTHONPATH: ${{ github.workspace }}
-          CH_MAX_RPM: "10"
-        run: |
-          python -m scripts.metadata_snapshot_and_fill \
-            --half "${{ matrix.half }}" \
-            --limit "1500" \
-            --batch-size "300" \
-            --max-rpm "10"
 
-  manual:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - name: Install deps
         run: python -m pip install -U pip pandas pyarrow requests
-      - name: Snapshot + API refresh (manual)
+
+      - name: API fill missing metadata
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
-          CH_MAX_RPM: ${{ inputs.max_rpm || '10' }}
+          # if max_rpm is empty, leave it unset — script falls back to 10
+          CH_MAX_RPM: ${{ inputs.max_rpm }}
+        shell: bash
         run: |
-          YEAR_ARG=""
-          if [ -n "${{ inputs.year }}" ]; then
-            YEAR_ARG="--year ${{ inputs.year }}"
+          EXTRA=""
+          if [ -n "${{ inputs.limit }}" ]; then
+            EXTRA="--limit ${{ inputs.limit }}"
           fi
 
-          python -m scripts.metadata_snapshot_and_fill \
-            $YEAR_ARG \
-            --half "${{ inputs.half || 'H1' }}" \
-            --limit "${{ inputs.limit || '1500' }}" \
-            --batch-size "${{ inputs.batch_size || '300' }}" \
-            --max-rpm "${{ inputs.max_rpm || '10' }}"
+          python -m scripts.metadata_bulk_api_fill \
+            --year "${{ inputs.year }}" \
+            --half "${{ inputs.half }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            $EXTRA
