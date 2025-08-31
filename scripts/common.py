@@ -1,86 +1,155 @@
 from __future__ import annotations
-import os, io, re, json, time, zipfile, hashlib, tempfile, datetime as dt
-from typing import List, Dict, Optional
-import pandas as pd
+
+import os
+import io
+import json
+import time
+import mimetypes
+from typing import Iterable, List, Optional
+
 import requests
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-GH_REPO = os.getenv("GH_REPO", "OWNER/REPO")  # e.g. 'ellaerkman/ixbrl-financials-db'
-GH_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_API = "https://api.github.com"
+
+# Single session for all HTTP
 SESSION = requests.Session()
-if GH_TOKEN:
-    SESSION.headers.update({"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"})
-SESSION.headers.update({"User-Agent": "Allosaurus/1.0"})
+SESSION.headers.update({"User-Agent": "CompaniesHouseFinder/1.0"})
 
-def _gh_api(url: str, method: str = "GET", **kwargs):
-    r = SESSION.request(method, url, timeout=120, **kwargs)
-    if not r.ok:
-        raise RuntimeError(f"GitHub API error {r.status_code}: {r.text[:400]}")
-    return r
 
-def gh_release_get(tag: str) -> Dict | None:
-    url = f"https://api.github.com/repos/{GH_REPO}/releases/tags/{tag}"
-    r = SESSION.get(url, timeout=60)
+# ----------------------------- GitHub API -----------------------------
+
+def _gh_token_repo() -> tuple[str, str]:
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GH_REPO")
+    if not token or not repo:
+        raise RuntimeError("GITHUB_TOKEN and GH_REPO environment variables must be set")
+    return token, repo
+
+def _gh(method: str, url: str, token: str, **kwargs) -> requests.Response:
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    headers["Accept"] = "application/vnd.github+json"
+    return SESSION.request(method, url, headers=headers, **kwargs)
+
+def gh_release_ensure(tag: str, name: Optional[str] = None) -> dict:
+    """
+    Ensure a release exists for tag; create if missing. Returns release JSON.
+    """
+    token, repo = _gh_token_repo()
+    r = _gh("GET", f"{GITHUB_API}/repos/{repo}/releases/tags/{tag}", token)
     if r.status_code == 404:
-        return None
+        payload = {"tag_name": tag, "name": name or tag, "draft": False, "prerelease": False}
+        r2 = _gh("POST", f"{GITHUB_API}/repos/{repo}/releases", token, json=payload)
+        r2.raise_for_status()
+        return r2.json()
     r.raise_for_status()
     return r.json()
 
-def gh_release_ensure(tag: str, name: Optional[str] = None) -> Dict:
-    rel = gh_release_get(tag)
-    if rel:
-        return rel
-    url = f"https://api.github.com/repos/{GH_REPO}/releases"
-    body = {"tag_name": tag, "name": name or tag, "draft": False, "prerelease": False}
-    return _gh_api(url, method="POST", json=body).json()
+def gh_release_refresh(tag: str) -> dict:
+    token, repo = _gh_token_repo()
+    r = _gh("GET", f"{GITHUB_API}/repos/{repo}/releases/tags/{tag}", token)
+    r.raise_for_status()
+    return r.json()
 
-def gh_release_find_asset(release: Dict, filename: str) -> Dict | None:
-    for a in release.get("assets", []):
-        if a.get("name") == filename:
+def gh_release_find_asset(rel: dict, name: str) -> Optional[dict]:
+    for a in rel.get("assets") or []:
+        if a.get("name") == name:
             return a
     return None
 
-def gh_release_download_asset(asset: Dict, dest_path: str) -> Optional[str]:
-    url = asset.get("browser_download_url")
-    if not url:
-        return None
-    r = SESSION.get(url, timeout=600)
-    r.raise_for_status()
-    with open(dest_path, "wb") as f:
-        f.write(r.content)
-    return dest_path
+def gh_release_download_asset(asset: dict, dest_path: str) -> None:
+    url = asset["browser_download_url"]
+    with SESSION.get(url, stream=True) as r, open(dest_path, "wb") as f:
+        r.raise_for_status()
+        for chunk in r.iter_content(chunk_size=1 << 20):
+            if chunk:
+                f.write(chunk)
 
-def gh_release_upload_or_replace_asset(release: Dict, filepath: str, name: Optional[str] = None):
-    # delete existing asset with same name (GitHub requires delete before replace)
-    fname = name or os.path.basename(filepath)
-    exist = gh_release_find_asset(release, fname)
-    if exist:
-        del_url = exist["url"]  # API URL
-        _gh_api(del_url, method="DELETE")
-    # upload
-    upload_url = release["upload_url"].split("{", 1)[0] + f"?name={fname}"
-    with open(filepath, "rb") as f:
-        data = f.read()
-    headers = {"Content-Type": "application/octet-stream"}
-    _gh_api(upload_url, method="POST", data=data, headers=headers)
+def gh_release_upload_or_replace_asset(rel: dict, file_path: str, name: str) -> dict:
+    """
+    Upload file as release asset, replacing existing asset of the same name.
 
-# Helpers
+    - Ignores 404 during delete (asset may already be gone / concurrent replace)
+    - Refreshes release before upload to avoid stale asset lists
+    - Returns the fresh release JSON
+    """
+    token, repo = _gh_token_repo()
 
-def half_from_date(d: dt.date) -> str:
-    return "H1" if d.month <= 6 else "H2"
+    # Best-effort delete of existing asset
+    existing = gh_release_find_asset(rel, name)
+    if existing:
+        del_url = f"{GITHUB_API}/repos/{repo}/releases/assets/{existing['id']}"
+        dr = _gh("DELETE", del_url, token)
+        # 204 = deleted, 404 = already gone; anything else raise
+        if dr.status_code not in (204, 404):
+            dr.raise_for_status()
+        # refresh after delete
+        rel = gh_release_refresh(rel["tag_name"])
 
-def tag_for_financials(year: int, half: str) -> str:
-    return f"data-{year}-{half}-financials"
+    # Upload
+    upload_url = rel["upload_url"].split("{", 1)[0]
+    mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    with open(file_path, "rb") as f:
+        ur = SESSION.post(
+            f"{upload_url}?name={name}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": mime,
+                "Accept": "application/vnd.github+json",
+            },
+            data=f,
+        )
+    if ur.status_code not in (200, 201):
+        # If another runner uploaded faster, GitHub may return 422; refresh and continue
+        if ur.status_code != 422:
+            ur.raise_for_status()
+    return gh_release_refresh(rel["tag_name"])
+# ---------------------------------------------------------------------
 
-def tag_for_metadata(year: int, half: str) -> str:
-    return f"data-{year}-{half}-metadata"
 
-# Idempotent append + de-dupe
+# ----------------------------- Parquet I/O ----------------------------
 
-def append_parquet(output_path: str, new_df: pd.DataFrame, subset_keys: List[str]):
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        old = pd.read_parquet(output_path)
-        df = pd.concat([old, new_df], ignore_index=True)
+def _to_arrow_table(df: pd.DataFrame) -> pa.Table:
+    """
+    Convert DataFrame to Arrow Table with light normalization so mixed types
+    (e.g., list/object) don't crash Parquet writes.
+    """
+    # Ensure list-like columns are stored as large_list<item=utf8>
+    arrays = {}
+    for c in df.columns:
+        s = df[c]
+        # Lists -> convert to string list safely
+        if s.dtype == "object" and any(isinstance(v, list) for v in s.dropna().head(10)):
+            arrays[c] = pa.array(
+                [v if isinstance(v, list) else (None if pd.isna(v) else [str(v)]) for v in s],
+                type=pa.large_list(pa.string()),
+            )
+        else:
+            arrays[c] = pa.array(s.astype("object").where(pd.notna(s), None))
+    return pa.table(arrays)
+
+def append_parquet(path: str, df_new: pd.DataFrame, subset_keys: Iterable[str]) -> None:
+    """
+    Append rows to Parquet at `path`, de-duplicating by `subset_keys`.
+    Creates the file if it doesn't exist.
+    """
+    # Normalize some common columns to string to avoid dtype conflicts
+    for c in df_new.columns:
+        if c.endswith("_date") or c in ("incorporation_date",):
+            # store dates as ISO text consistently
+            df_new[c] = pd.to_datetime(df_new[c], errors="coerce").dt.strftime("%Y-%m-%d")
+    # Read existing if present
+    if os.path.exists(path):
+        df_old = pd.read_parquet(path)
+        df_all = pd.concat([df_old, df_new], ignore_index=True)
     else:
-        df = new_df.copy()
-    df.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-    df.to_parquet(output_path, index=False)
+        df_all = df_new.copy()
+
+    df_all = df_all.drop_duplicates(subset=list(subset_keys), keep="last")
+
+    # Write with pyarrow
+    table = _to_arrow_table(df_all)
+    pq.write_table(table, path, compression="snappy")
