@@ -153,3 +153,17 @@ def append_parquet(path: str, df_new: pd.DataFrame, subset_keys: Iterable[str]) 
     # Write with pyarrow
     table = _to_arrow_table(df_all)
     pq.write_table(table, path, compression="snappy")
+
+# ----------------------- Helpers for date bucketing -----------------------
+
+def half_from_date(d) -> str:
+    """
+    Return 'H1' if month <= 6 else 'H2'.
+    Accepts a datetime.date, datetime, or pandas Timestamp.
+    """
+    if pd.isna(d):
+        return None
+    month = getattr(d, "month", None)
+    if not month:
+        return None
+    return "H1" if month <= 6 else "H2"
