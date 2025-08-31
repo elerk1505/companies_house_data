@@ -172,6 +172,8 @@ def build_metadata_from_snapshot(snap: pd.DataFrame) -> pd.DataFrame:
 
     if "incorporation_date" in df.columns:
         df["incorporation_date"] = pd.to_datetime(df["incorporation_date"], errors="coerce")
+        # Convert back to string in ISO format
+        df["incorporation_date"] = df["incorporation_date"].dt.strftime("%Y-%m-%d")
 
     for c in [
         "companies_house_registered_number","entity_current_legal_name","company_status",
@@ -199,7 +201,7 @@ def fetch_company_profile(api_id: str, *, max_rpm: int) -> Dict[str, Any]:
         "entity_current_legal_name": j.get("company_name"),
         "company_type": j.get("type"),
         "company_status": j.get("company_status"),
-        "incorporation_date": j.get("date_of_creation"),
+        "incorporation_date": j.get("date_of_creation") or None,
         "sic_codes": j.get("sic_codes", []),
         "registered_office_postcode": roa.get("postal_code"),
         "registered_office_post_town": roa.get("locality"),
