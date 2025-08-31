@@ -134,19 +134,27 @@ def _to_arrow_table(df: pd.DataFrame) -> pa.Table:
 def append_parquet(path: str, df_new: pd.DataFrame, subset_keys: Iterable[str]) -> None:
     """
     Append rows to Parquet at `path`, de-duplicating by `subset_keys`.
-    Ensures dates are stored as ISO strings to avoid dtype conflicts.
+    Creates the file if it doesn't exist or is empty/corrupt.
     """
+    # Normalize date-like fields to ISO strings (consistent across writers)
     for c in df_new.columns:
         if c.endswith("_date") or c in ("incorporation_date",):
             df_new[c] = pd.to_datetime(df_new[c], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    if os.path.exists(path):
-        df_old = pd.read_parquet(path)
-        df_all = pd.concat([df_old, df_new], ignore_index=True)
-    else:
+    # Try to read existing parquet; start fresh if missing/empty/corrupt
+    must_fresh = True
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        try:
+            df_old = pd.read_parquet(path)
+            df_all = pd.concat([df_old, df_new], ignore_index=True)
+            must_fresh = False
+        except Exception as e:
+            print(f"[warn] could not read existing parquet {path} ({e}); recreating fresh")
+    if must_fresh:
         df_all = df_new.copy()
 
     df_all = df_all.drop_duplicates(subset=list(subset_keys), keep="last")
+
     table = _to_arrow_table(df_all)
     pq.write_table(table, path, compression="snappy")
 
@@ -155,14 +163,13 @@ def append_parquet(path: str, df_new: pd.DataFrame, subset_keys: Iterable[str]) 
 def half_from_date(d) -> str | None:
     """
     Return 'H1' if month <= 6 else 'H2'.
-    Accepts datetime/date/Timestamp; returns None if month missing.
+    Accepts datetime/date/Timestamp or string; returns None if unknown.
     """
     if pd.isna(d):
         return None
     m = getattr(d, "month", None)
     if not m:
         try:
-            # try parse if string
             dt = pd.to_datetime(d, errors="coerce")
             if pd.isna(dt):
                 return None
