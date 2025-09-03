@@ -2,22 +2,20 @@
 # scripts/ixbrl_fetch_daily.py  — Action 1 (Daily Financials)
 # ================================================================
 """
-Fetch the last 5 days of Companies House daily accounts ZIPs and append parsed
-financials into the correct half-year Parquet stored as a GitHub Release asset.
+Fetch the last N days (including today) of Companies House daily accounts ZIPs
+and append parsed financials into the correct half-year Parquet stored as a
+GitHub Release asset.
 
-• Skips 404s automatically (some dates won't exist yet)
-• Skips already-processed URLs via state/financials_state.json (committed by the workflow)
-• De-dupes on (company_id, balance_sheet_date) if present; else (company_id, period_end)
+• Includes TODAY if available (fix for being "one day behind")
+• DAYS_LOOKBACK env var (default 7) controls the rolling window
+• HEAD probe avoids downloading 404s
+• Skips already-processed URLs via state/financials_state.json
+• De-dupes on (company_id, balance_sheet_date) else (company_id, period_end)
 • Handles nested ZIPs that contain iXBRL HTML files
-• Buckets by balance_sheet_date -> year/H1|H2 (fallback to period_end, then zip date)
 
-Requirements in your workflow step:
-    python -m pip install -U pip pandas pyarrow requests ixbrlparse
-
-Depends on helper utilities in scripts/common.py:
-  - SESSION, gh_release_ensure, gh_release_find_asset, gh_release_download_asset,
-    gh_release_upload_or_replace_asset, append_parquet, half_from_date, tag_for_financials
+Requires: pandas, pyarrow, requests, (optional) ixbrlparse
 """
+
 from __future__ import annotations
 
 import io
@@ -30,6 +28,7 @@ import zipfile
 from typing import Dict, List
 
 import pandas as pd
+import requests
 
 from scripts.common import (
     SESSION,
@@ -42,13 +41,14 @@ from scripts.common import (
     tag_for_financials,
 )
 
-# --- Constants ---
-DAILY_FILE_FMT = "Accounts_Bulk_Data-{date}.zip"   # e.g. 2025-08-29
+# --- Constants & settings ---
+DAILY_FILE_FMT = "Accounts_Bulk_Data-{date}.zip"   # e.g. 2025-09-03
 DAILY_BASE_URL = "https://download.companieshouse.gov.uk/"
 OUTPUT_BASENAME = "financials.parquet"
 STATE_PATH = os.getenv("STATE_PATH", "state/financials_state.json")
+DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "7"))  # inclusive of today
 
-# Try fast HTML iXBRL parsing; otherwise we'll use lightweight fallbacks
+# Optional iXBRL parser
 TRY_IXBRLPARSE = True
 try:
     import ixbrlparse  # type: ignore
@@ -84,7 +84,6 @@ TARGET_COLUMNS = [
 # Normalizer for concept names
 _norm = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())
 
-# Likely concept aliases -> our target columns
 ALIASES = {
     # P&L
     "turnover": "turnover_gross_operating_revenue",
@@ -120,7 +119,6 @@ ALIASES = {
     "averagenumberemployeesduringperiod": "average_number_employees_during_period",
 }
 
-# Common keys to probe directly from parsed facts
 NAME_KEYS = ("entityCurrentLegalName", "EntityCurrentLegalName")
 NUM_KEYS  = ("companiesHouseRegisteredNumber", "CompaniesHouseRegisteredNumber")
 PERIOD_START_KEYS = ("periodStart", "PeriodStart", "period_start")
@@ -129,18 +127,11 @@ BALSHEET_KEYS     = ("balanceSheetDate", "BalanceSheetDate", "balance_sheet_date
 DORMANT_KEYS      = ("companyDormant", "CompanyDormant", "dormant", "isDormant")
 COMP_TYPE_KEYS    = ("companyType", "type")
 SIC_KEYS          = ("sicCode", "sicCodes", "sic_code")
-TAXONOMY_KEYS     = ("taxonomy", "taxonomyName", "taxonomyVersion", "documentType")  # best-effort
+TAXONOMY_KEYS     = ("taxonomy", "taxonomyName", "taxonomyVersion", "documentType")
 
-# Minimal fallbacks
 CH_NUM_RE = re.compile(rb"[^0-9]([0-9]{8})[^0-9]")
-DATE_RE   = re.compile(rb"(20[0-9]{2}-[01][0-9]-[0-3][0-9])")
-
 
 def _extract_from_ixbrl_bytes(data: bytes, zip_url: str, run_code: str) -> Dict[str, object]:
-    """
-    Parse a single iXBRL HTML/XHTML into our wide record.
-    Returns {} if required keys can't be found.
-    """
     out: Dict[str, object] = {
         "zip_url": zip_url,
         "run_code": run_code,
@@ -156,13 +147,10 @@ def _extract_from_ixbrl_bytes(data: bytes, zip_url: str, run_code: str) -> Dict[
             out["error"] = f"ixbrlparse:{type(e).__name__}"
 
     if isinstance(facts, dict) and facts:
-        # IDs & name
         for k in NAME_KEYS:
-            if k in facts:
-                out["entity_current_legal_name"] = facts[k]; break
+            if k in facts: out["entity_current_legal_name"] = facts[k]; break
         for k in NUM_KEYS:
-            if k in facts:
-                out["companies_house_registered_number"] = str(facts[k]); break
+            if k in facts: out["companies_house_registered_number"] = str(facts[k]); break
         for k in PERIOD_START_KEYS:
             if k in facts: out["period_start"] = facts[k]; break
         for k in PERIOD_END_KEYS:
@@ -181,34 +169,28 @@ def _extract_from_ixbrl_bytes(data: bytes, zip_url: str, run_code: str) -> Dict[
         for k in TAXONOMY_KEYS:
             if k in facts: out["taxonomy"] = str(facts[k]); break
 
-        # Numeric aliases
         for key, val in facts.items():
             if isinstance(val, (int, float, str)):
                 norm = _norm(key)
                 if norm in ALIASES:
                     out[ALIASES[norm]] = val
 
-    # Fallbacks for minimal ID/date if parser didn’t give them
     if "companies_house_registered_number" not in out:
         m = CH_NUM_RE.search(data)
         if m:
             out["companies_house_registered_number"] = m.group(1).decode("utf-8")
 
-    # provenance fields
     out["date"] = run_code
     if "companies_house_registered_number" in out:
         out["company_id"] = out["companies_house_registered_number"]
-
     return out
-
 
 def _parse_daily_zip(zip_path: str, zip_url: str, run_code: str) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     with zipfile.ZipFile(zip_path, "r") as z:
         for info in z.infolist():
-            name = info.filename
-            # Nested monthly parts often appear as inner ZIPs containing HTML/XHTML
-            if name.lower().endswith(".zip"):
+            name = info.filename.lower()
+            if name.endswith(".zip"):
                 with z.open(info) as f:
                     inner = f.read()
                 try:
@@ -222,7 +204,7 @@ def _parse_daily_zip(zip_path: str, zip_url: str, run_code: str) -> pd.DataFrame
                                     rows.append(rec)
                 except zipfile.BadZipFile:
                     continue
-            elif name.lower().endswith((".html", ".htm", ".xhtml")):
+            elif name.endswith((".html", ".htm", ".xhtml")):
                 with z.open(info) as f:
                     doc = f.read()
                 rec = _extract_from_ixbrl_bytes(doc, zip_url, run_code)
@@ -234,14 +216,13 @@ def _parse_daily_zip(zip_path: str, zip_url: str, run_code: str) -> pd.DataFrame
 
     df = pd.DataFrame(rows)
 
-    # ensure all columns exist
     for c in TARGET_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
 
-    # coerce types
     for c in ["period_start", "period_end", "incorporation_date", "balance_sheet_date", "date"]:
         df[c] = pd.to_datetime(df[c], errors="coerce")
+
     NUMS = [
         "tangible_fixed_assets", "debtors", "cash_bank_in_hand", "current_assets",
         "creditors_due_within_one_year", "creditors_due_after_one_year", "net_current_assets_liabilities",
@@ -258,12 +239,25 @@ def _parse_daily_zip(zip_path: str, zip_url: str, run_code: str) -> pd.DataFrame
     for c in NUMS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # drop rows without an id
     df = df.dropna(subset=["companies_house_registered_number"])
-
-    # keep column order
     return df[TARGET_COLUMNS]
 
+def _head_exists(url: str) -> bool:
+    """Fast existence probe to avoid downloading 404s."""
+    try:
+        r = SESSION.head(url, timeout=30, allow_redirects=True)
+        if r.status_code == 200:
+            return True
+        if r.status_code == 405:
+            # some origins don’t allow HEAD reliably; fall back to GET with stream
+            g = SESSION.get(url, stream=True, timeout=30)
+            try:
+                return g.status_code == 200
+            finally:
+                g.close()
+        return False
+    except requests.RequestException:
+        return False
 
 def main():
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
@@ -272,22 +266,26 @@ def main():
         state = json.load(open(STATE_PATH, "r", encoding="utf-8"))
 
     today = dt.date.today()
-    # Companies House publishes Tue–Sat (covering previous days).
-    # We just grab the last 5 calendar days safely.
-    check_dates = [today - dt.timedelta(days=i) for i in range(1, 6)]
+
+    # NEW: include today, then look back N-1 days
+    check_dates = [today - dt.timedelta(days=i) for i in range(0, max(1, DAYS_LOOKBACK))]
+    # newest first so today's file gets priority
+    check_dates.sort(reverse=True)
 
     for d in check_dates:
         date_str = d.strftime("%Y-%m-%d")
         fname = DAILY_FILE_FMT.format(date=date_str)
         url = f"{DAILY_BASE_URL}{fname}"
+
         if url in state.get("processed", []):
             print(f"[skip] already processed {url}")
             continue
 
-        r = SESSION.get(url, timeout=600)
-        if r.status_code == 404:
-            print(f"[skip] {url} -> 404")
+        if not _head_exists(url):
+            print(f"[skip] {url} -> 404 (HEAD)")
             continue
+
+        r = SESSION.get(url, timeout=600)
         r.raise_for_status()
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
             f.write(r.content)
@@ -299,17 +297,19 @@ def main():
 
         if df.empty:
             print(f"[warn] no rows parsed from {url}; leaving unprocessed")
-            continue  # don't mark as processed so we can retry/tweak later
+            continue  # don’t mark as processed so we can retry later
 
         # Pick release using balance_sheet_date, else period_end, else zip date
-        ref = (
-            df["balance_sheet_date"].dropna().iloc[0]
-            if "balance_sheet_date" in df and df["balance_sheet_date"].notna().any()
-            else (df["period_end"].dropna().iloc[0] if df["period_end"].notna().any() else pd.Timestamp(d))
-        )
+        if df["balance_sheet_date"].notna().any():
+            ref = df["balance_sheet_date"].dropna().iloc[0]
+        elif df["period_end"].notna().any():
+            ref = df["period_end"].dropna().iloc[0]
+        else:
+            ref = pd.Timestamp(d)
+
         ref_date = pd.to_datetime(ref, errors="coerce").date()
         year = ref_date.year
-        half = half_from_date(ref_date)
+        half = half_from_date(ref_date) or ("H1" if ref_date.month <= 6 else "H2")
 
         rel = gh_release_ensure(tag_for_financials(year, half), name=f"Financials {year} {half}")
 
@@ -320,23 +320,24 @@ def main():
 
         before = 0
         if os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
-            before = len(pd.read_parquet(tmp_out))
+            try:
+                before = len(pd.read_parquet(tmp_out))
+            except Exception as e:
+                print(f"[warn] could not read existing parquet ({e}); starting fresh")
 
         # dedupe on (company_id, balance_sheet_date|period_end)
-        dedupe_keys = ["companies_house_registered_number"]
         key_date = "balance_sheet_date" if df["balance_sheet_date"].notna().any() else "period_end"
-        dedupe_keys.append(key_date)
+        dedupe_keys = ["companies_house_registered_number", key_date]
 
         append_parquet(tmp_out, df, subset_keys=dedupe_keys)
-
         after = len(pd.read_parquet(tmp_out))
         print(f"[info] appended to {year} {half}: {before} -> {after} rows")
 
-        # mark processed only after a successful append
+        # Upload/replace asset & mark processed only after successful append
+        gh_release_upload_or_replace_asset(rel, tmp_out, OUTPUT_BASENAME)
         state.setdefault("processed", []).append(url)
 
     json.dump(state, open(STATE_PATH, "w", encoding="utf-8"), indent=2)
-
 
 if __name__ == "__main__":
     main()
