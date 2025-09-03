@@ -7,6 +7,7 @@
 # 2) API-fill remaining missing IDs with profile (+light advanced).
 #
 # Safe for repeated runs; it dedupes on company_id and appends.
+# Uploads to GitHub Releases are retried to avoid transient SSL EOFs.
 # ================================================================
 
 from __future__ import annotations
@@ -50,9 +51,19 @@ def to_api_company_number(ixbrl_id: str | None) -> str | None:
     if not ixbrl_id:
         return None
     s = str(ixbrl_id).strip()
-    if s.isdigit():
-        return s.zfill(8)
-    return s
+    if not s.isdigit():
+        return None
+    if len(s) > 8:
+        return None
+    return s.zfill(8)
+
+_DATE8_RE = re.compile(r"^(20[0-9]{2})(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])$")
+
+def looks_like_yyyymmdd_digits(s: str) -> bool:
+    """True if s is 8 digits and plausibly a YYYYMMDD date (common false-positive in some extracts)."""
+    if not s or not s.isdigit() or len(s) != 8:
+        return False
+    return bool(_DATE8_RE.match(s))
 
 # ---------------------------- HTTP session ---------------------------
 SESS = requests.Session()
@@ -73,6 +84,7 @@ def _pace(max_rpm: int) -> None:
     _recent.append(time.time())
 
 def _get(url: str, *, max_rpm: int, **kw) -> requests.Response:
+    """GET with pacing + simple exponential backoff for 429."""
     backoff = 2.0
     for _ in range(8):
         _pace(max_rpm)
@@ -106,12 +118,16 @@ def guess_latest_snapshot_url(today: dt.date | None = None) -> Tuple[int, int, s
     """Pick the latest monthly snapshot (1st of month). Fallback to previous month if 404."""
     if today is None:
         today = dt.date.today()
-    # snapshot usually available within ~5 working days after month end. Use current month by default.
     y, m = today.year, today.month
     url = onefile_url(y, m)
-    r = requests.get(url, timeout=30)
-    if r.status_code == 404:
-        # fallback to previous month
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code == 404:
+            prev = (today.replace(day=1) - dt.timedelta(days=1))
+            y, m = prev.year, prev.month
+            url = onefile_url(y, m)
+    except Exception:
+        # fall back silently to previous month on any network issue
         prev = (today.replace(day=1) - dt.timedelta(days=1))
         y, m = prev.year, prev.month
         url = onefile_url(y, m)
@@ -158,8 +174,13 @@ def build_metadata_from_snapshot(snap: pd.DataFrame) -> pd.DataFrame:
     if sic4: ren[sic4] = "sic4"
     df = df.rename(columns=ren)
 
-    df["companies_house_registered_number"] = df["companies_house_registered_number"].map(norm_ixbrl_id)
+    # Normalize to your digits-only id
+    if "companies_house_registered_number" in df.columns:
+        df["companies_house_registered_number"] = df["companies_house_registered_number"].map(norm_ixbrl_id)
+    else:
+        df["companies_house_registered_number"] = pd.NA
 
+    # Pack SIC list
     sic_cols = [c for c in ["sic1","sic2","sic3","sic4"] if c in df.columns]
     if sic_cols:
         def pack(row):
@@ -170,11 +191,12 @@ def build_metadata_from_snapshot(snap: pd.DataFrame) -> pd.DataFrame:
     else:
         df["sic_codes"] = None
 
+    # Coerce incorporation_date to ISO string
     if "incorporation_date" in df.columns:
-        df["incorporation_date"] = pd.to_datetime(df["incorporation_date"], errors="coerce")
-        # Convert back to string in ISO format
-        df["incorporation_date"] = df["incorporation_date"].dt.strftime("%Y-%m-%d")
+        d = pd.to_datetime(df["incorporation_date"], errors="coerce", dayfirst=False)
+        df["incorporation_date"] = d.dt.strftime("%Y-%m-%d")
 
+    # Ensure all expected columns exist
     for c in [
         "companies_house_registered_number","entity_current_legal_name","company_status",
         "company_type","incorporation_date","registered_office_post_town","registered_office_postcode",
@@ -189,48 +211,24 @@ def build_metadata_from_snapshot(snap: pd.DataFrame) -> pd.DataFrame:
          "incorporation_date","registered_office_post_town","registered_office_postcode","sic_codes","last_updated"]
     ]
 
-# ----------------------------- API helpers ----------------------------
-def fetch_company_profile(api_id: str, *, max_rpm: int) -> Dict[str, Any]:
-    r = _get(f"{API_BASE}/company/{api_id}", max_rpm=max_rpm)
-    if r.status_code == 404:
-        raise requests.HTTPError("404", response=r)
-    r.raise_for_status()
-    j = r.json()
-    roa = j.get("registered_office_address") or {}
-    return {
-        "entity_current_legal_name": j.get("company_name"),
-        "company_type": j.get("type"),
-        "company_status": j.get("company_status"),
-        "incorporation_date": j.get("date_of_creation") or None,
-        "sic_codes": j.get("sic_codes", []),
-        "registered_office_postcode": roa.get("postal_code"),
-        "registered_office_post_town": roa.get("locality"),
-    }
-
-def fetch_advanced(api_id: str, name: str | None, *, max_rpm: int) -> Dict[str, Any]:
-    if not name:
-        return {}
-    try:
-        params = {"company_name_includes": name, "size": 200}
-        r = _get(f"{API_BASE}/advanced-search/companies", params=params, max_rpm=max_rpm)
-        if not r.ok:
-            return {}
-        for it in r.json().get("items", []):
-            num = it.get("company_number")
-            got = to_api_company_number(num) if num else None
-            if got and got == api_id:
-                ro = it.get("registered_office_address") or {}
-                out = {
-                    "company_status": it.get("company_status") or None,
-                    "registered_office_postcode": ro.get("postal_code"),
-                    "registered_office_post_town": ro.get("locality"),
-                }
-                if it.get("sic_codes"):
-                    out["sic_codes"] = it["sic_codes"]
-                return out
-    except Exception:
-        pass
-    return {}
+# ------------------------- Safe upload wrapper ------------------------
+def safe_upload(rel: dict, path: str, *, name: str, attempts: int = 6) -> None:
+    """
+    Wrap gh_release_upload_or_replace_asset with exponential backoff so
+    transient TLS EOFs on uploads.github.com don't fail the run.
+    """
+    delay = 1.0
+    for i in range(1, attempts + 1):
+        try:
+            gh_release_upload_or_replace_asset(rel, path, name=name)
+            return
+        except Exception as e:
+            if i == attempts:
+                print(f"[warn] release upload failed after retries: {e}")
+                return  # soft-fail; data was written locally
+            print(f"[warn] upload attempt {i}/{attempts} failed: {e}; sleeping {delay:.1f}s")
+            time.sleep(delay)
+            delay *= 1.8
 
 # ------------------------------- Main ---------------------------------
 def main():
@@ -256,12 +254,20 @@ def main():
     tmp_fin = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
     gh_release_download_asset(fin_asset, tmp_fin)
     fin_df = pd.read_parquet(tmp_fin)
+
     fin_ids_series = pd.Series(dtype=object)
     if "companies_house_registered_number" in fin_df.columns:
         fin_ids_series = pd.concat([fin_ids_series, fin_df["companies_house_registered_number"]], ignore_index=True)
     if "company_id" in fin_df.columns:
         fin_ids_series = pd.concat([fin_ids_series, fin_df["company_id"]], ignore_index=True)
-    fin_ids = fin_ids_series.map(norm_ixbrl_id).dropna().astype(str).unique().tolist()
+
+    fin_ids = (
+        fin_ids_series.map(norm_ixbrl_id)
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
     fin_set: Set[str] = set(fin_ids)
     print(f"[info] financial IDs in {fin_tag}: {len(fin_set):,}")
 
@@ -282,43 +288,56 @@ def main():
             existing = set()
 
     # 3) Snapshot merge (fast path)
-    y_s, m_s, url = guess_latest_snapshot_url()
+    _, _, url = guess_latest_snapshot_url()
     print(f"[info] snapshot chosen: {url}")
-    snap = load_snapshot_df(url)
-    print(f"[info] snapshot rows: {len(snap):,}")
-    snap_meta = build_metadata_from_snapshot(snap)
+    try:
+        snap = load_snapshot_df(url)
+        print(f"[info] snapshot rows: {len(snap):,}")
+        snap_meta = build_metadata_from_snapshot(snap)
 
-    # Only those in financials and not already present
-    before = len(snap_meta)
-    snap_meta = snap_meta[
-        snap_meta["companies_house_registered_number"].isin(fin_set - existing)
-    ]
-    after = len(snap_meta)
-    print(f"[info] snapshot matched: {after:,} / {before:,} rows")
+        before = len(snap_meta)
+        snap_meta = snap_meta[
+            snap_meta["companies_house_registered_number"].isin(fin_set - existing)
+        ]
+        after = len(snap_meta)
+        print(f"[info] snapshot matched: {after:,} / {before:,} rows")
 
-    if after > 0:
-        # Append snapshot rows
-        if meta_asset:
-            gh_release_download_asset(meta_asset, tmp_meta)
-        append_parquet(tmp_meta, snap_meta, subset_keys=["companies_house_registered_number"])
-        gh_release_upload_or_replace_asset(meta_rel, tmp_meta, name=OUTPUT_BASENAME)
-        print(f"[ok] appended snapshot rows: {after}")
+        if after > 0:
+            if meta_asset:
+                gh_release_download_asset(meta_asset, tmp_meta)
+            append_parquet(tmp_meta, snap_meta, subset_keys=["companies_house_registered_number"])
+            safe_upload(meta_rel, tmp_meta, name=OUTPUT_BASENAME)
+            print(f"[ok] appended snapshot rows: {after}")
 
-        # refresh 'existing' set
-        existing = set(
-            pd.read_parquet(tmp_meta, columns=["companies_house_registered_number"])
-            ["companies_house_registered_number"].map(norm_ixbrl_id).dropna().astype(str).unique()
-        )
+            # refresh 'existing'
+            try:
+                existing = set(
+                    pd.read_parquet(tmp_meta, columns=["companies_house_registered_number"])
+                    ["companies_house_registered_number"].map(norm_ixbrl_id).dropna().astype(str).unique()
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[warn] snapshot step skipped due to error: {e}")
 
     # 4) API fill remaining (capped)
-    remain = [cid for cid in fin_ids if cid not in existing]
+    remain_raw = [cid for cid in fin_ids if cid not in existing]
+
+    # Filter obvious false positives (YYYYMMDD-like numbers)
+    remain = []
+    for cid in remain_raw:
+        if looks_like_yyyymmdd_digits(cid):
+            # Date-like 8-digit numbers are not CH company numbers; skip to avoid 404 spam
+            continue
+        remain.append(cid)
+
     if not remain:
         print("[info] nothing left to fetch via API")
     else:
         cap = max(0, args.limit or 0)
         if cap > 0:
             remain = remain[:cap]
-            print(f"[info] API-fill: processing first {cap} companies")
+            print(f"[info] API-fill: processing first {len(remain)} companies")
         else:
             print(f"[info] API-fill: processing all {len(remain):,} companies")
 
@@ -329,8 +348,9 @@ def main():
             try:
                 api_cid = to_api_company_number(cid)
                 if not api_cid:
+                    # skip non-numeric or too-long ids
                     continue
-                # Profile
+
                 r = _get(f"{API_BASE}/company/{api_cid}", max_rpm=args.max_rpm)
                 if r.status_code == 404:
                     print(f"[warn] {cid}: HTTP 404")
@@ -339,7 +359,7 @@ def main():
                 j = r.json()
                 roa = j.get("registered_office_address") or {}
                 row = {
-                    "companies_house_registered_number": cid,  # store in your digits-only key
+                    "companies_house_registered_number": cid,  # keep your digits-only id
                     "entity_current_legal_name": j.get("company_name"),
                     "company_type": j.get("type"),
                     "company_status": j.get("company_status"),
@@ -349,10 +369,29 @@ def main():
                     "registered_office_post_town": roa.get("locality"),
                     "last_updated": pd.Timestamp.utcnow().isoformat(),
                 }
-                # Optional enrichment
-                adv = fetch_advanced(api_cid, row.get("entity_current_legal_name"), max_rpm=args.max_rpm)
-                if adv:
-                    row.update({k: v for k, v in adv.items() if v is not None})
+                # Optional enrichment (advanced search)
+                name = row.get("entity_current_legal_name")
+                if name:
+                    try:
+                        params = {"company_name_includes": name, "size": 200}
+                        rr = _get(f"{API_BASE}/advanced-search/companies", params=params, max_rpm=args.max_rpm)
+                        if rr.ok:
+                            for it in rr.json().get("items", []):
+                                num = str(it.get("company_number") or "").strip()
+                                got = to_api_company_number(re.sub(r"\D", "", num)) if num else None
+                                if got and got == api_cid:
+                                    ro = it.get("registered_office_address") or {}
+                                    if it.get("company_status"):
+                                        row["company_status"] = it["company_status"]
+                                    if it.get("sic_codes"):
+                                        row["sic_codes"] = it["sic_codes"]
+                                    if ro.get("postal_code"):
+                                        row["registered_office_postcode"] = ro["postal_code"]
+                                    if ro.get("locality"):
+                                        row["registered_office_post_town"] = ro["locality"]
+                                    break
+                    except Exception:
+                        pass
 
                 buffer.append(row); fetched += 1
             except Exception as e:
@@ -365,7 +404,7 @@ def main():
                     if meta_asset:
                         gh_release_download_asset(meta_asset, tmp_meta)
                     append_parquet(tmp_meta, df, subset_keys=["companies_house_registered_number"])
-                    gh_release_upload_or_replace_asset(meta_rel, tmp_meta, name=OUTPUT_BASENAME)
+                    safe_upload(meta_rel, tmp_meta, name=OUTPUT_BASENAME)
                     print(f"[info] checkpoint: appended {len(df)} rows (i={i})")
                     buffer.clear()
 
@@ -376,7 +415,7 @@ def main():
                 if meta_asset:
                     gh_release_download_asset(meta_asset, tmp_meta)
                 append_parquet(tmp_meta, df, subset_keys=["companies_house_registered_number"])
-                gh_release_upload_or_replace_asset(meta_rel, tmp_meta, name=OUTPUT_BASENAME)
+                safe_upload(meta_rel, tmp_meta, name=OUTPUT_BASENAME)
                 print(f"[ok] appended final {len(df)} rows")
 
         print(f"[ok] API fill fetched {fetched} rows")
