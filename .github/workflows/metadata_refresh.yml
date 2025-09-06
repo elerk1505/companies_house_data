@@ -17,20 +17,30 @@ on:
         options: [H1, H2]
         default: ""
       limit:
-        description: "API cap per run"
+        description: "API cap per run (0 = unlimited; use time budget)"
         required: false
         type: string
-        default: "1500"
+        default: "0"
       max_rpm:
-        description: "Max requests/min (8–15)"
+        description: "Max requests/min (10–15 recommended)"
         required: false
         type: string
-        default: "10"
+        default: "12"
       batch_size:
-        description: "Checkpoint size"
+        description: "Checkpoint size (uploads per run)"
         required: false
         type: string
-        default: "300"
+        default: "600"
+      time_budget_mins:
+        description: "Stop API fill after N minutes (default 350 ≈ 5h50m)"
+        required: false
+        type: string
+        default: "350"
+      no_advanced:
+        description: "Skip advanced-search enrichment (faster)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -58,13 +68,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
-          CH_MAX_RPM: "10"
+          CH_MAX_RPM: "12"
+          TIME_BUDGET_MINS: "350"
         run: |
           python -m scripts.metadata_snapshot_and_fill \
             --half "${{ matrix.half }}" \
-            --limit "1500" \
-            --batch-size "300" \
-            --max-rpm "10"
+            --limit "0" \
+            --batch-size "600" \
+            --max-rpm "${CH_MAX_RPM}" \
+            --time-budget-mins "${TIME_BUDGET_MINS}" \
+            --no-advanced
 
   # ---- Manual: run exactly one half if user chose one ----
   manual_single:
@@ -85,18 +98,23 @@ jobs:
           GH_REPO: ${{ github.repository }}
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
-          CH_MAX_RPM: ${{ inputs.max_rpm || '10' }}
         run: |
           YEAR_ARG=""
           if [ -n "${{ inputs.year }}" ]; then
             YEAR_ARG="--year ${{ inputs.year }}"
           fi
+          ADV_ARG=""
+          if [ "${{ inputs.no_advanced }}" = "true" ]; then
+            ADV_ARG="--no-advanced"
+          fi
           python -m scripts.metadata_snapshot_and_fill \
             $YEAR_ARG \
             --half "${{ inputs.half }}" \
-            --limit "${{ inputs.limit || '1500' }}" \
-            --batch-size "${{ inputs.batch_size || '300' }}" \
-            --max-rpm "${{ inputs.max_rpm || '10' }}"
+            --limit "${{ inputs.limit }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --max-rpm "${{ inputs.max_rpm }}" \
+            --time-budget-mins "${{ inputs.time_budget_mins }}" \
+            $ADV_ARG
 
   # ---- Manual: if user left half blank, run both halves via matrix ----
   manual_both:
@@ -120,15 +138,20 @@ jobs:
           GH_REPO: ${{ github.repository }}
           CH_API_KEY: ${{ secrets.CH_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
-          CH_MAX_RPM: ${{ inputs.max_rpm || '10' }}
         run: |
           YEAR_ARG=""
           if [ -n "${{ inputs.year }}" ]; then
             YEAR_ARG="--year ${{ inputs.year }}"
           fi
+          ADV_ARG=""
+          if [ "${{ inputs.no_advanced }}" = "true" ]; then
+            ADV_ARG="--no-advanced"
+          fi
           python -m scripts.metadata_snapshot_and_fill \
             $YEAR_ARG \
             --half "${{ matrix.half }}" \
-            --limit "${{ inputs.limit || '1500' }}" \
-            --batch-size "${{ inputs.batch_size || '300' }}" \
-            --max-rpm "${{ inputs.max_rpm || '10' }}"
+            --limit "${{ inputs.limit }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --max-rpm "${{ inputs.max_rpm }}" \
+            --time-budget-mins "${{ inputs.time_budget_mins }}" \
+            $ADV_ARG
