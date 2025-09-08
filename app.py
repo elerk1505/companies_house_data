@@ -152,6 +152,13 @@ row_cap = st.sidebar.number_input("Max rows to show", 100, 200_000, 10_000, step
 
 # --- Build data model ---------------------------------------------------------
 con = connect_duckdb()
+# --- Make reruns idempotent: drop any old views first -------------------------
+def reset_views(con):
+    # Drop in reverse dependency order; CASCADE handles nested deps safely
+    for v in ["_fin_latest", "_fin", "_meta_uniq", "_meta", "_meta_raw"]:
+        con.execute(f"DROP VIEW IF EXISTS {v} CASCADE")
+
+reset_views(con)
 manifest = build_manifest(GH_REPO)
 
 fin_sql  = f"SELECT * FROM read_parquet({json.dumps(manifest['fin_urls'])})"
@@ -298,12 +305,17 @@ where_sql = "WHERE " + " AND ".join(where) if where else ""
 
 # Latest financial row per company (best-effort date)
 con.execute("""
-CREATE OR REPLACE TEMP VIEW _fin_latest AS
+CREATE TEMP VIEW _fin_latest AS
 SELECT * FROM (
   SELECT *,
          ROW_NUMBER() OVER (
            PARTITION BY _key
-           ORDER BY COALESCE(balance_sheet_date, period_end, date) DESC NULLS LAST
+           ORDER BY COALESCE(
+             try_cast(balance_sheet_date AS TIMESTAMP),
+             try_cast(period_end        AS TIMESTAMP),
+             try_cast(date              AS TIMESTAMP),
+             TIMESTAMP '1900-01-01 00:00:00'
+           ) DESC
          ) AS rn
   FROM _fin
 ) t WHERE rn=1
