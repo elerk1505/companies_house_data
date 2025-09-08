@@ -27,7 +27,7 @@ GH_REPO = "elerk1505/companies_house_data"
 FIN_NAME = "financials.parquet"
 META_NAME = "metadata.parquet"
 
-# Optional, only to raise GitHub rate limits; not required for public repos
+# Optional token for higher GitHub rate limits
 try:
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or st.secrets.get("GITHUB_TOKEN", "")
 except Exception:
@@ -35,15 +35,15 @@ except Exception:
 
 NUMERIC_COLS: List[str] = [
     "average_number_employees_during_period",
-    "tangible_fixed_assets", "debtors", "cash_bank_in_hand", "current_assets",
-    "creditors_due_within_one_year", "creditors_due_after_one_year", "net_current_assets_liabilities",
-    "total_assets_less_current_liabilities", "net_assets_liabilities_including_pension_asset_liability",
-    "called_up_share_capital", "profit_loss_account_reserve", "shareholder_funds",
-    "turnover_gross_operating_revenue", "other_operating_income", "cost_sales", "gross_profit_loss",
-    "administrative_expenses", "raw_materials_consumables", "staff_costs",
+    "tangible_fixed_assets","debtors","cash_bank_in_hand","current_assets",
+    "creditors_due_within_one_year","creditors_due_after_one_year","net_current_assets_liabilities",
+    "total_assets_less_current_liabilities","net_assets_liabilities_including_pension_asset_liability",
+    "called_up_share_capital","profit_loss_account_reserve","shareholder_funds",
+    "turnover_gross_operating_revenue","other_operating_income","cost_sales","gross_profit_loss",
+    "administrative_expenses","raw_materials_consumables","staff_costs",
     "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
-    "other_operating_charges_format2", "operating_profit_loss",
-    "profit_loss_on_ordinary_activities_before_tax", "tax_on_profit_or_loss_on_ordinary_activities",
+    "other_operating_charges_format2","operating_profit_loss",
+    "profit_loss_on_ordinary_activities_before_tax","tax_on_profit_or_loss_on_ordinary_activities",
     "profit_loss_for_period",
 ]
 
@@ -78,7 +78,6 @@ def pick_assets(rel: dict) -> Tuple[Optional[str], Optional[str]]:
 
 @st.cache_data(show_spinner=True)
 def build_manifest(repo: str) -> Dict[str, list[str]]:
-    """Return URL lists for all financials + metadata across every release."""
     fins, metas = [], []
     for r in list_releases(repo):
         fin, meta = pick_assets(r)
@@ -105,7 +104,6 @@ def connect_duckdb():
     return con
 
 def sic_section_case(col: str) -> str:
-    # Map SIC 2-digit prefix to section A..U
     return f"""
     CASE WHEN try_strict_cast({col} AS INT) IS NULL THEN NULL
       ELSE CASE
@@ -159,7 +157,7 @@ manifest = build_manifest(GH_REPO)
 fin_sql  = f"SELECT * FROM read_parquet({json.dumps(manifest['fin_urls'])})"
 meta_sql = f"SELECT * FROM read_parquet({json.dumps(manifest['meta_urls'])})"
 
-# Normalise join keys (digit-only, no leading zeros)
+# 1) FINANCIALS view with normalized key
 fin_view = f"""
 SELECT
   COALESCE(
@@ -171,24 +169,52 @@ FROM ({fin_sql})
 """
 con.execute("CREATE OR REPLACE TEMP VIEW _fin AS " + fin_view)
 
-meta_base = f"""
+# 2) METADATA: create raw view, inspect columns, then safely build SELECT
+con.execute("CREATE OR REPLACE TEMP VIEW _meta_raw AS " + f"SELECT * FROM ({meta_sql})")
+meta_cols = {r[1] for r in con.execute("PRAGMA table_info('_meta_raw')").fetchall()}
+
+def present(*cands: str) -> list[str]:
+    return [c for c in cands if c in meta_cols]
+
+def mk_key_expr(cols: list[str]) -> str:
+    if not cols:
+        # hard stop – we can't join without a key
+        return None
+    parts = [f"NULLIF(LTRIM(REGEXP_REPLACE({c}::TEXT,'[^0-9]','','g'),'0'),'')" for c in cols]
+    return "COALESCE(" + ",".join(parts) + ") AS _key"
+
+key_cols = present("companies_house_registered_number","CompanyNumber","company_number")
+key_expr = mk_key_expr(key_cols)
+if key_expr is None:
+    st.error("No company number column found in metadata assets (expected one of: "
+             "`companies_house_registered_number`, `CompanyNumber`, `company_number`).")
+    st.stop()
+
+name_cols   = present("entity_current_legal_name","company_name")
+ctype_cols  = present("company_type","CompanyCategory","type")
+cstat_cols  = present("company_status","CompanyStatus","status")
+inc_cols    = present("incorporation_date","IncorporationDate","date_of_creation")
+sic_cols    = present("sic_codes")
+
+def mk_coalesce(cols: list[str], alias: str) -> str:
+    if not cols:
+        return f"NULL AS {alias}"
+    return "COALESCE(" + ",".join(cols) + f") AS {alias}"
+
+meta_prepped_sql = f"""
 SELECT
-  COALESCE(
-    NULLIF(LTRIM(REGEXP_REPLACE(companies_house_registered_number::TEXT,'[^0-9]','','g'),'0'),''),
-    NULLIF(LTRIM(REGEXP_REPLACE(CompanyNumber::TEXT,'[^0-9]','','g'),'0'),''),
-    NULLIF(LTRIM(REGEXP_REPLACE(company_number::TEXT,'[^0-9]','','g'),'0'),'')
-  ) AS _key,
-  COALESCE(entity_current_legal_name, company_name) AS entity_current_legal_name,
-  COALESCE(company_type, CompanyCategory, type)       AS company_type,
-  COALESCE(company_status, CompanyStatus, status)     AS company_status,
-  COALESCE(incorporation_date, IncorporationDate, date_of_creation) AS incorporation_date,
-  sic_codes
-FROM ({meta_sql})
+  {key_expr},
+  {mk_coalesce(name_cols,  'entity_current_legal_name')},
+  {mk_coalesce(ctype_cols, 'company_type')},
+  {mk_coalesce(cstat_cols, 'company_status')},
+  {mk_coalesce(inc_cols,   'incorporation_date')},
+  {('sic_codes' if sic_cols else 'NULL')} AS sic_codes
+FROM _meta_raw
 WHERE _key IS NOT NULL
 """
-con.execute("CREATE OR REPLACE TEMP VIEW _meta AS " + meta_base)
+con.execute("CREATE OR REPLACE TEMP VIEW _meta AS " + meta_prepped_sql)
 
-# Distinct one metadata row per company (no reliable timestamp → arbitrary)
+# One metadata row per company
 con.execute("""
 CREATE OR REPLACE TEMP VIEW _meta_uniq AS
 SELECT * FROM (
@@ -198,10 +224,10 @@ SELECT * FROM (
 ) t WHERE rn=1
 """)
 
-# Discover available columns (for disabling missing numeric filters)
+# Discover financial columns to enable/disable numeric filters
 fin_cols = {r[1] for r in con.execute("PRAGMA table_info('_fin')").fetchall()}
 
-# Fill categorical dropdowns from metadata
+# Fill dropdowns from metadata
 cats = [r[0] for r in con.execute("SELECT DISTINCT company_type FROM _meta_uniq WHERE company_type IS NOT NULL ORDER BY 1").fetchall()]
 sts  = [r[0] for r in con.execute("SELECT DISTINCT company_status FROM _meta_uniq WHERE company_status IS NOT NULL ORDER BY 1").fetchall()]
 cat_choice = st.sidebar.selectbox("Company category", ["(any)"] + cats, index=0)
@@ -247,7 +273,7 @@ if wanted_section != "(any)":
     where.append(f"EXISTS (SELECT 1 FROM UNNEST(_meta_uniq.sic_codes) AS c WHERE {sec} = $sec)")
     params["sec"] = wanted_section
 
-# Numeric filters (render all; disable if missing; only add SQL for present+filled)
+# Numeric filters (render all; disable if missing; only add SQL if present + filled)
 specs = []
 for col in NUMERIC_COLS:
     present = col in fin_cols
@@ -270,7 +296,7 @@ for col, present, mn, mx in specs:
 
 where_sql = "WHERE " + " AND ".join(where) if where else ""
 
-# Latest financial row per company (most recent by common date fields)
+# Latest financial row per company (best-effort date)
 con.execute("""
 CREATE OR REPLACE TEMP VIEW _fin_latest AS
 SELECT * FROM (
