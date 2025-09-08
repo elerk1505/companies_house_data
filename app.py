@@ -6,10 +6,9 @@ from functools import lru_cache
 from typing import List, Tuple, Dict, Any, Optional
 
 import streamlit as st
-import duckdb
 import requests
 
-
+# Try to import duckdb only here
 try:
     import duckdb  # noqa: F401
 except Exception as e:
@@ -19,9 +18,9 @@ except Exception as e:
         f"sys.path[0]: {sys.path[0]}\n"
         f"Exception: {e}\n\n"
         "Fixes:\n"
-        "• Ensure runtime.txt at repo root is `python-3.12.4`.\n"
+        "• Ensure runtime.txt at repo root is `python-3.12.4` (or any 3.12.x).\n"
         "• Ensure requirements.txt contains `duckdb==0.10.3`.\n"
-        "• Reboot & clear cache from Streamlit Cloud."
+        "• From Streamlit Cloud: Menu → Clear cache, then Reboot."
     )
     st.stop()
 
