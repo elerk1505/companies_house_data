@@ -1,0 +1,12 @@
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+runOnSave = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base="light"
+primaryColor="#1351f5"
