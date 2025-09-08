@@ -288,14 +288,25 @@ FROM ({meta_sql})
 """
 con.execute("CREATE OR REPLACE TEMP VIEW _meta_base AS " + meta_cols_sql)
 
-# Get dropdown choices
+# Get dropdown choices (fixed)
 cats = con.execute("""
-SELECT DISTINCT COALESCE(company_type, CompanyCategory, type) AS cat
-FROM _meta_base WHERE cat IS NOT NULL ORDER BY cat
+SELECT cat
+FROM (
+  SELECT DISTINCT COALESCE(company_type, CompanyCategory, type) AS cat
+  FROM _meta_base
+) t
+WHERE cat IS NOT NULL
+ORDER BY cat
 """).fetchall()
+
 stats = con.execute("""
-SELECT DISTINCT COALESCE(company_status, CompanyStatus, status) AS st
-FROM _meta_base WHERE st IS NOT NULL ORDER BY st
+SELECT st
+FROM (
+  SELECT DISTINCT COALESCE(company_status, CompanyStatus, status) AS st
+  FROM _meta_base
+) t
+WHERE st IS NOT NULL
+ORDER BY st
 """).fetchall()
 
 # Update dropdowns with discovered values
