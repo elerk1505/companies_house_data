@@ -87,22 +87,55 @@ st.sidebar.subheader("Incorporation date")
 date_from = st.sidebar.text_input("From (YYYY-MM-DD)", "")
 date_to   = st.sidebar.text_input("To (YYYY-MM-DD)", "")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GitHub helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# --- GitHub helpers (replace your existing gh_session and list_releases) ---
+
 def gh_session() -> requests.Session:
     s = requests.Session()
-    if GITHUB_TOKEN:
-        s.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    tok = (os.getenv("GITHUB_TOKEN") or
+           (st.secrets.get("GITHUB_TOKEN") if hasattr(st, "secrets") else "")) or ""
+
+    # GitHub expects "token <PAT>", not "Bearer ..."
+    if tok:
+        s.headers["Authorization"] = f"token {tok.strip()}"
     s.headers["User-Agent"] = "CH-Finder/1.0"
     s.headers["Accept"] = "application/vnd.github+json"
     return s
 
-@lru_cache(maxsize=1)
+def github_rate_limit_note(r: requests.Response) -> str:
+    rem = r.headers.get("X-RateLimit-Remaining")
+    lim = r.headers.get("X-RateLimit-Limit")
+    why = r.headers.get("X-RateLimit-Resource")
+    return f"(rate {rem}/{lim} resource={why})" if rem and lim else ""
+
+@st.cache_data(show_spinner=False)
 def list_releases(repo: str) -> list[dict]:
     url = f"https://api.github.com/repos/{repo}/releases?per_page=100"
     r = gh_session().get(url, timeout=60)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        # Helpful message in the UI without leaking your token
+        status = r.status_code
+        tip = ""
+        if status == 401:
+            tip = (
+                "Got **401 Unauthorized** from GitHub. "
+                "Most common causes:\n"
+                "• The GITHUB_TOKEN in Streamlit *Secrets* is missing or mistyped\n"
+                "• You pasted it without quotes in TOML\n"
+                "• It’s a fine-grained token that doesn’t allow this repo\n"
+                "• The token has expired or was revoked"
+            )
+        elif status == 403:
+            tip = (
+                "Got **403** (often rate-limit). Add a GITHUB_TOKEN in Secrets "
+                "or wait for the limit window to reset."
+            )
+        st.error(
+            f"GitHub API error {status} when listing releases.\n\n"
+            f"{github_rate_limit_note(r)}\n\n{tip}"
+        )
+        raise
     return r.json()
 
 def tag_parts(text: str) -> Optional[tuple[int, str, str]]:
