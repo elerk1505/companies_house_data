@@ -68,7 +68,16 @@ latest_toggle = st.sidebar.toggle(
     value=True,
     help="If off, queries span ALL filings across all releases."
 )
-row_cap = st.sidebar.number_input("Max rows to show", 100, 200_000, 10_000, step=1000)
+# --- Row display with "Load more" ---
+if "rows_to_show" not in st.session_state:
+    st.session_state.rows_to_show = 50   # start with 50
+
+st.sidebar.write(f"Currently showing {st.session_state.rows_to_show} rows")
+
+if st.sidebar.button("Load more rows"):
+    st.session_state.rows_to_show += 50
+
+row_cap = st.session_state.rows_to_show
 
 st.sidebar.subheader("Search")
 q_name = st.sidebar.text_input("Company name contains", "")
