@@ -1,10 +1,6 @@
-# ================================================================
-# scripts/ixbrl_bulk_parse.py  — Action 3 (Bulk Financials via MONTHLY archives)
-# ================================================================
+# scripts/ixbrl_bulk_parse.py — Robust bulk runner over monthly/year bundles
 from __future__ import annotations
 
-import os
-import io
 import re
 import sys
 import time
@@ -25,7 +21,6 @@ from scripts.common import (
     gh_release_download_asset,
     gh_release_upload_or_replace_asset,
     append_parquet,
-    half_from_date,
     tag_for_financials,
 )
 
@@ -37,29 +32,22 @@ from scripts.ixbrl_fetch_daily import (
 
 BASE = "https://download.companieshouse.gov.uk"
 OUTPUT_BASENAME = "financials.parquet"
-
 DAILY_ZIP_NAME_RE = re.compile(r"Accounts_Bulk_Data-(\d{4})-(\d{2})-(\d{2})\.zip$", re.I)
 
-
 def month_name(month: int) -> str:
-    return calendar.month_name[month]  # "January", "February", ...
-
+    return calendar.month_name[month]  # "January"
 
 def monthly_urls(year: int, month: int) -> List[str]:
-    """Yield candidate monthly archive URLs in order of likelihood."""
     mname = month_name(month)
     return [
-        f"{BASE}/Accounts_Monthly_Data-{mname}{year}.zip",                 # primary (recent)
-        f"{BASE}/archive/Accounts_Monthly_Data-{mname}{year}.zip",         # archive (older)
+        f"{BASE}/Accounts_Monthly_Data-{mname}{year}.zip",         # primary
+        f"{BASE}/archive/Accounts_Monthly_Data-{mname}{year}.zip", # archive
     ]
 
-
 def year_bundle_url(year: int) -> str | None:
-    """Return year bundle URL for 2008/2009; else None."""
     if year in (2008, 2009):
         return f"{BASE}/archive/Accounts_Monthly_Data-JanuaryToDecember{year}.zip"
     return None
-
 
 def http_get_to_temp(url: str, timeout: int = 600) -> str:
     r = SESSION.get(url, timeout=timeout)
@@ -70,23 +58,11 @@ def http_get_to_temp(url: str, timeout: int = 600) -> str:
         f.write(r.content)
         return f.name
 
-
 def parse_month_from_monthly_zip(local_zip: str, url: str, year: int, month: int) -> pd.DataFrame:
-    """
-    Parse a standard monthly archive.
-    Most monthly zips contain nested daily zips and/or direct iXBRL HTML files.
-    Our daily parser already supports nested zips, so we can delegate.
-    """
-    # run_code provenance = YYYY-MM (month granularity)
-    run_code = f"{year}-{month:02d}"
+    run_code = f"{year}-{month:02d}"  # month provenance
     return _parse_daily_zip(local_zip, url, run_code)
 
-
 def parse_month_from_year_bundle(local_zip: str, bundle_url: str, year: int, month: int) -> pd.DataFrame:
-    """
-    Parse a YEAR bundle (2008/2009) but include ONLY the requested month.
-    We filter inner daily zips by their filename date (YYYY-MM-DD).
-    """
     frames: List[pd.DataFrame] = []
     with zipfile.ZipFile(local_zip, "r") as z:
         for info in z.infolist():
@@ -97,7 +73,6 @@ def parse_month_from_year_bundle(local_zip: str, bundle_url: str, year: int, mon
             yy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
             if yy != year or mm != month:
                 continue
-            # Extract that inner daily zip to temp and parse via daily parser
             with z.open(info) as f:
                 inner_bytes = f.read()
             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
@@ -112,28 +87,21 @@ def parse_month_from_year_bundle(local_zip: str, bundle_url: str, year: int, mon
         return pd.DataFrame(columns=TARGET_COLUMNS)
     return pd.concat(frames, ignore_index=True)[TARGET_COLUMNS]
 
-
-def route_release_key_for_row(ts: pd.Timestamp) -> Tuple[int, str]:
-    year = ts.year
-    half = "H1" if ts.month <= 6 else "H2"
-    return year, half
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--year", type=int, required=True, help="Year, e.g. 2025")
+    ap.add_argument("--year", type=int, required=True, help="Year, e.g. 2021")
     ap.add_argument("--months", type=str, required=True, help="Comma list of months, e.g. 1,2,3")
     args = ap.parse_args()
 
     months = [int(m.strip()) for m in args.months.split(",") if m.strip()]
     if not months:
-        print("[error] no months provided")
+        print("[error] no months provided", file=sys.stderr)
         sys.exit(2)
 
     combined: List[pd.DataFrame] = []
 
     for m in months:
-        # 1) Try standard monthly archive locations
+        # 1) Standard monthly archives
         urls = monthly_urls(args.year, m)
         parsed = False
         for url in urls:
@@ -142,6 +110,29 @@ def main():
                 zpath = http_get_to_temp(url)
                 df = parse_month_from_monthly_zip(zpath, url, args.year, m)
                 print(f"[info] parsed {len(df)} rows from monthly archive {url}")
+
+                # ---- Diagnostics: see whether metrics populated in this batch ----
+                if not df.empty:
+                    numeric_cols = [
+                        "tangible_fixed_assets","debtors","cash_bank_in_hand","current_assets",
+                        "creditors_due_within_one_year","creditors_due_after_one_year",
+                        "net_current_assets_liabilities","total_assets_less_current_liabilities",
+                        "net_assets_liabilities_including_pension_asset_liability",
+                        "called_up_share_capital","profit_loss_account_reserve","shareholder_funds",
+                        "turnover_gross_operating_revenue","other_operating_income","cost_sales","gross_profit_loss",
+                        "administrative_expenses","raw_materials_consumables","staff_costs",
+                        "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+                        "other_operating_charges_format2","operating_profit_loss",
+                        "profit_loss_on_ordinary_activities_before_tax",
+                        "tax_on_profit_or_loss_on_ordinary_activities","profit_loss_for_period",
+                    ]
+                    pres = [c for c in numeric_cols if c in df.columns]
+                    if pres:
+                        nn = df[pres].notna().sum().sort_values(ascending=False)
+                        print(f"[diag {args.year}-{m:02d}] non-null counts (top 10):")
+                        print(nn.head(10).to_string())
+                # ------------------------------------------------------------------
+
                 if not df.empty:
                     combined.append(df)
                 parsed = True
@@ -156,7 +147,7 @@ def main():
         if parsed:
             continue
 
-        # 2) Fallback: year bundle for 2008/2009
+        # 2) Fallback: 2008/2009 year bundle
         yurl = year_bundle_url(args.year)
         if yurl:
             try:
@@ -164,6 +155,28 @@ def main():
                 ypath = http_get_to_temp(yurl)
                 df = parse_month_from_year_bundle(ypath, yurl, args.year, m)
                 print(f"[info] parsed {len(df)} rows for {args.year}-{m:02d} from year bundle")
+
+                # diagnostics
+                if not df.empty:
+                    numeric_cols = [
+                        "tangible_fixed_assets","debtors","cash_bank_in_hand","current_assets",
+                        "creditors_due_within_one_year","creditors_due_after_one_year",
+                        "net_current_assets_liabilities","total_assets_less_current_liabilities",
+                        "net_assets_liabilities_including_pension_asset_liability",
+                        "called_up_share_capital","profit_loss_account_reserve","shareholder_funds",
+                        "turnover_gross_operating_revenue","other_operating_income","cost_sales","gross_profit_loss",
+                        "administrative_expenses","raw_materials_consumables","staff_costs",
+                        "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+                        "other_operating_charges_format2","operating_profit_loss",
+                        "profit_loss_on_ordinary_activities_before_tax",
+                        "tax_on_profit_or_loss_on_ordinary_activities","profit_loss_for_period",
+                    ]
+                    pres = [c for c in numeric_cols if c in df.columns]
+                    if pres:
+                        nn = df[pres].notna().sum().sort_values(ascending=False)
+                        print(f"[diag {args.year}-{m:02d} bundle] non-null counts (top 10):")
+                        print(nn.head(10).to_string())
+
                 if not df.empty:
                     combined.append(df)
                 continue
@@ -173,8 +186,6 @@ def main():
                 print(f"[warn] unexpected error for year bundle {yurl}: {e}")
 
         print(f"[warn] no data found for {args.year}-{m:02d}")
-
-        # be polite to CH
         time.sleep(0.5)
 
     if not combined:
@@ -193,11 +204,9 @@ def main():
     ref = pd.to_datetime(ref, errors="coerce").fillna(fb)
     years = ref.dt.year.astype(int)
     halves = ref.dt.month.apply(lambda mm: "H1" if int(mm) <= 6 else "H2")
-    routes = list(zip(years.tolist(), halves.tolist()))
+    df_all = df_all.assign(_route=[f"{y}-{h}" for y, h in zip(years.tolist(), halves.tolist())])
 
-    # append into releases partitioned by (year, half)
-    df_all = df_all.assign(_route=[f"{y}-{h}" for y, h in routes])
-
+    # Upload into releases partitioned by (year, half)
     for route_key, part in df_all.groupby("_route"):
         y_str, half = route_key.split("-")
         year = int(y_str)
@@ -208,7 +217,7 @@ def main():
         if asset:
             gh_release_download_asset(asset, tmp_out)
 
-        # dedupe: prefer (company_id, balance_sheet_date) else (company_id, period_end)
+        # De-dupe keys: prefer (CH number, balance_sheet_date) else (CH number, period_end)
         keys = ["companies_house_registered_number"]
         if "balance_sheet_date" in part and part["balance_sheet_date"].notna().any():
             keys.append("balance_sheet_date")
