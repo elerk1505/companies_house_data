@@ -1,36 +1,48 @@
-# scripts/ixbrl_fetch_daily.py
-# Robust daily iXBRL parser used by the bulk job.
+      # ================================================================
+# scripts/ixbrl_fetch_daily.py  — core iXBRL parsing (used by daily & bulk)
+# ================================================================
 from __future__ import annotations
 
 import io
-import math
+import os
 import re
 import zipfile
-import tempfile
+import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+
 import pandas as pd
 
-# ixbrlparse is optional but highly recommended
-try:
-    import ixbrlparse  # pip install ixbrlparse
-    TRY_IXBRLPARSE = True
-except Exception:
-    TRY_IXBRLPARSE = False
+# ixbrlparse is tiny and pure-Python. We rely only on a small surface:
+# Document(f) -> .facts (list); each fact has:
+#   .name (qname, e.g. "frs102:NetCurrentAssetsLiabilities")
+#   .value (str/number)
+#   .decimals (int/str/None)
+#   .unit (str/None)
+#   .period.instant (datetime|None)  OR .period.start/.period.end
+from ixbrlparse import IXBRL
 
-# ---------------- Schema: keep these aligned with the app ----------------
+# --------------------------------------------------------------------------------------
+# Public surface used by bulk:
+#  * TARGET_COLUMNS
+#  * _parse_daily_zip(zip_path, zip_url, run_code) -> DataFrame
+# --------------------------------------------------------------------------------------
+
 TARGET_COLUMNS: List[str] = [
-    "run_code",
-    "companies_house_registered_number",
-    "date",
-    "file_type",
-    "taxonomy",
-    "balance_sheet_date",
-    "entity_current_legal_name",
-    "company_dormant",
+    # provenance
+    "run_code", "zip_url",
+
+    # top-level filing/date info
+    "date", "file_type", "taxonomy",
+
+    # identity
+    "companies_house_registered_number", "company_id",
+    "entity_current_legal_name", "company_type", "company_dormant",
+    "sic_code", "incorporation_date",
+
+    # period information
+    "balance_sheet_date", "period_start", "period_end",
     "average_number_employees_during_period",
-    "period_start",
-    "period_end",
 
     # balance sheet (instant)
     "tangible_fixed_assets",
@@ -43,10 +55,8 @@ TARGET_COLUMNS: List[str] = [
     "total_assets_less_current_liabilities",
     "net_assets_liabilities_including_pension_asset_liability",
     "called_up_share_capital",
-    "profit_loss_account_reserve",
-    "shareholder_funds",
 
-    # P&L (duration)
+    # p&l (duration)
     "turnover_gross_operating_revenue",
     "other_operating_income",
     "cost_sales",
@@ -61,409 +71,413 @@ TARGET_COLUMNS: List[str] = [
     "tax_on_profit_or_loss_on_ordinary_activities",
     "profit_loss_for_period",
 
-    # provenance
+    # misc
     "error",
-    "zip_url",
 ]
 
-# Which normalized targets are instant (BS) vs duration (P&L)
-BALANCE_SHEET_NORMALIZED = {
-    "tangible_fixed_assets","debtors","cash_bank_in_hand","current_assets",
-    "creditors_due_within_one_year","creditors_due_after_one_year",
-    "net_current_assets_liabilities","total_assets_less_current_liabilities",
-    "net_assets_liabilities_including_pension_asset_liability",
-    "called_up_share_capital","profit_loss_account_reserve","shareholder_funds",
-}
+# --------------------------------------------------------------------------------------
+# Helpers: number normalization, period handling, synonym maps
+# --------------------------------------------------------------------------------------
 
-PNL_NORMALIZED = {
-    "turnover_gross_operating_revenue","other_operating_income","cost_sales","gross_profit_loss",
-    "administrative_expenses","raw_materials_consumables","staff_costs",
-    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
-    "other_operating_charges_format2","operating_profit_loss",
-    "profit_loss_on_ordinary_activities_before_tax",
-    "tax_on_profit_or_loss_on_ordinary_activities","profit_loss_for_period",
-}
+_NON_DIGIT = re.compile(r"[^0-9\-\.+]", re.U)
 
-# ---------------- Concept synonyms (extend as needed) ----------------
-CONCEPT_SYNONYMS: Dict[str, List[str]] = {
-    # Balance sheet
-    "tangible_fixed_assets": [
-        "TangibleFixedAssets", "uk-gaap:TangibleFixedAssets",
-    ],
-    "debtors": [
-        "Debtors", "TradeAndOtherReceivables", "uk-gaap:Debtors",
-    ],
-    "cash_bank_in_hand": [
-        "CashBankInHand", "CashAndCashEquivalents", "uk-gaap:CashBankInHand",
-    ],
-    "current_assets": [
-        "CurrentAssets", "uk-gaap:CurrentAssets",
-    ],
-    "creditors_due_within_one_year": [
-        "CreditorsDueWithinOneYear", "CurrentBorrowings", "uk-gaap:CreditorsDueWithinOneYear",
-    ],
-    "creditors_due_after_one_year": [
-        "CreditorsDueAfterOneYear", "NoncurrentBorrowings", "uk-gaap:CreditorsDueAfterOneYear",
-    ],
-    "net_current_assets_liabilities": [
-        "NetCurrentAssetsLiabilities", "NetCurrentAssetsLiabilitiesTotal",
-        "uk-gaap:NetCurrentAssetsLiabilities", "ifrs-full:NetCurrentAssetsLiabilities",
-    ],
-    "total_assets_less_current_liabilities": [
-        "TotalAssetsLessCurrentLiabilities","TotalAssetsMinusCurrentLiabilities",
-        "uk-gaap:TotalAssetsLessCurrentLiabilities",
-    ],
-    "net_assets_liabilities_including_pension_asset_liability": [
-        "NetAssetsLiabilitiesIncludingPensionAssetLiability","NetAssetsLiabilitiesIncludingPensionAsset",
-        "NetAssetsLiabilities","NetAssets",
-        "uk-gaap:NetAssetsLiabilitiesIncludingPensionAssetLiability",
-    ],
-    "called_up_share_capital": [
-        "CalledUpShareCapital","CalledUpShareCapitalPresentedEquity","uk-gaap:CalledUpShareCapital",
-    ],
-    "profit_loss_account_reserve": [
-        "ProfitLossAccountReserve","RetainedEarnings","uk-gaap:ProfitLossAccountReserve",
-    ],
-    "shareholder_funds": [
-        "ShareholderFunds","Equity","TotalEquity","uk-gaap:ShareholderFunds",
-    ],
-
-    # P&L
-    "turnover_gross_operating_revenue": [
-        "TurnoverGrossOperatingRevenue","Revenue","Turnover","ifrs-full:Revenue","uk-gaap:TurnoverGrossOperatingRevenue",
-    ],
-    "other_operating_income": [
-        "OtherOperatingIncome","OtherIncome","uk-gaap:OtherOperatingIncome",
-    ],
-    "cost_sales": [
-        "CostSales","CostOfSales","CostOfRevenue","uk-gaap:CostOfSales",
-    ],
-    "gross_profit_loss": [
-        "GrossProfitLoss","GrossProfit","GrossLoss","uk-gaap:GrossProfitLoss",
-    ],
-    "administrative_expenses": [
-        "AdministrativeExpenses","AdministrativeExpense","uk-gaap:AdministrativeExpenses",
-    ],
-    "raw_materials_consumables": [
-        "RawMaterialsConsumables","RawMaterialsAndConsumablesUsed","uk-gaap:RawMaterialsAndConsumables",
-    ],
-    "staff_costs": [
-        "StaffCosts","EmployeeBenefitsExpense","uk-gaap:StaffCosts",
-    ],
-    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets": [
-        "DepreciationOtherAmountsWrittenOffTangibleIntangibleFixedAssets","DepreciationAmortisationAndImpairment",
-        "DepreciationAndAmortisationExpense",
-    ],
-    "other_operating_charges_format2": [
-        "OtherOperatingChargesFormat2","OtherOperatingExpenses","OtherExpenses",
-    ],
-    "operating_profit_loss": [
-        "OperatingProfitLoss","ProfitLossFromOperatingActivities","OperatingProfit","OperatingLoss",
-    ],
-    "profit_loss_on_ordinary_activities_before_tax": [
-        "ProfitLossOnOrdinaryActivitiesBeforeTax","ProfitLossBeforeTax","ProfitBeforeTax","LossBeforeTax",
-    ],
-    "tax_on_profit_or_loss_on_ordinary_activities": [
-        "TaxOnProfitOrLossOnOrdinaryActivities","TaxExpense","CurrentTaxExpense",
-    ],
-    "profit_loss_for_period": [
-        "ProfitLossForPeriod","ProfitLoss","ProfitOrLoss","ProfitForTheYear","LossForTheYear",
-        "ifrs-full:ProfitLoss"
-    ],
-}
-
-# identifiers & meta concept guesses
-COMPANY_NO_CONCEPTS = [
-    "CompaniesHouseRegisteredNumber", "CompanyNumber", "uk-bus:UKCompaniesHouseRegisteredNumber",
-    "uk-core:CompanyNumber", "EntityCompaniesHouseRegisteredNumber"
-]
-ENTITY_NAME_CONCEPTS = [
-    "EntityCurrentLegalName","EntityReportingName","NameOfReportingEntityOrOtherMeansOfIdentification",
-    "EntityName","CompanyName"
-]
-INCORP_DATE_CONCEPTS = ["IncorporationDate","incorporationDate","DateOfIncorporation"]
-PERIOD_START_CONCEPTS = ["StartDateForPeriodCoveredByReport","PeriodStart", "PeriodStartDate", "StartDate"]
-PERIOD_END_CONCEPTS = ["EndDateForPeriodCoveredByReport","PeriodEnd","PeriodEndDate", "EndDate"]
-BALSHEET_DATE_CONCEPTS = ["BalanceSheetDate","StatementOfFinancialPositionDate","BalanceSheetAsAt"]
-
-BOOL_DORMANT_CONCEPTS = ["CompanyDormant","EntityDormantIndicator"]
-AVG_EMPLOYEES_CONCEPTS = ["AverageNumberEmployeesDuringPeriod","AverageNumberEmployees","EmployeesAverage"]
-
-
-# ---------------------- helpers: robust conversions ----------------------
-def _to_float(value: Any) -> Optional[float]:
-    """list/tuple → first; strings with £/commas/() → float; else numeric; None if not convertible."""
-    if value is None:
+def _to_float(x) -> Optional[float]:
+    """Convert strings like '£1,234', '(456)' to float; keep None for blanks."""
+    if x is None:
         return None
-    if isinstance(value, (list, tuple)) and value:
-        value = value[0]
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and math.isnan(value):
-            return None
-        return float(value)
-    if isinstance(value, str):
-        v = value.strip()
-        if not v:
-            return None
-        neg = v.startswith("(") and v.endswith(")")
-        v = v.strip("()£$€").replace(",", "")
-        try:
-            x = float(v)
-            return -x if neg else x
-        except Exception:
-            return None
-    return None
-
-def _first_match_from_facts(facts: List[dict], concept_names: Iterable[str]) -> Optional[Any]:
-    for f in facts:
-        c = f.get("concept") or f.get("name")
-        if c in concept_names:
-            v = f.get("value")
-            if v not in (None, "", "NULL", "null"):
-                return v
-    return None
-
-def _best_numeric_fact(
-    facts: List[dict],
-    synonym_list: List[str],
-    want_instant: bool,
-    period_end_hint: Optional[str],
-    instant_hint: Optional[str],
-) -> Optional[float]:
-    """
-    Choose the best numeric fact:
-    - exact concept in synonyms
-    - instant/duration matches
-    - pick closest date to hint; else latest
-    - accept GBP/unitless/other units; no over-filter
-    """
-    cands: List[Tuple[pd.Timestamp | None, float]] = []
-    for f in facts:
-        c = f.get("concept") or f.get("name")
-        if c not in synonym_list:
-            continue
-        ctx = f.get("context") or {}
-        p = ctx.get("period") or {}
-        ptype = p.get("type")
-        is_instant = (ptype == "instant")
-        if want_instant != is_instant:
-            continue
-        d = p.get("instant") if is_instant else p.get("end")
-        val = _to_float(f.get("value"))
-        if val is None:
-            continue
-        # unit accepted (GBP/unitless/anything)
-        try:
-            dt = pd.to_datetime(d, errors="coerce") if d else None
-        except Exception:
-            dt = None
-        cands.append((dt, val))
-
-    if not cands:
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
         return None
-
-    # pick closest to hint (if provided), else latest date
-    def _score(rec_dt: Optional[pd.Timestamp], hint: Optional[str]) -> pd.Timedelta:
-        if rec_dt is None or hint is None:
-            return pd.Timedelta.max
-        h = pd.to_datetime(hint, errors="coerce")
-        if pd.isna(h) or pd.isna(rec_dt):
-            return pd.Timedelta.max
-        return abs(rec_dt - h)
-
-    if want_instant and instant_hint:
-        cands.sort(key=lambda t: _score(t[0], instant_hint))
-    elif (not want_instant) and period_end_hint:
-        cands.sort(key=lambda t: _score(t[0], period_end_hint))
-    else:
-        cands.sort(key=lambda t: (t[0] is None, t[0]))  # None last; earliest→latest
-
-    return cands[-1][1] if (instant_hint is None and period_end_hint is None) else cands[0][1]
-
-# -------------------- ixbrl: normalize facts from parser --------------------
-def _read_ixbrl_facts(data: bytes) -> Optional[List[dict]]:
-    """Return a list of dict facts with keys: concept/name, value, context{period{type,instant,end}}."""
-    if not TRY_IXBRLPARSE:
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    s = _NON_DIGIT.sub("", s)
+    if s in ("", "-", "+"):
         return None
     try:
-        obj = ixbrlparse.parse(io.BytesIO(data))  # library’s parse
+        return float(s)
     except Exception:
         return None
 
-    # Try to normalize across potential shapes
-    facts: List[dict] = []
-    raw_facts = None
+def _scale_by_decimals(val: Optional[float], decimals) -> Optional[float]:
+    """Handle common 'decimals' semantics: negative => scaled thousands/millions."""
+    if val is None or decimals is None:
+        return val
+    try:
+        d = int(decimals)
+    except Exception:
+        return val
+    if d < 0:
+        return val * (10 ** (-d))
+    return val
 
-    # Common: obj.facts is a list
-    raw_facts = getattr(obj, "facts", None)
-    if raw_facts is None and isinstance(obj, dict):
-        raw_facts = obj.get("facts")
+def _period_type(fact) -> str:
+    """Return 'instant' or 'duration' for a fact."""
+    p = getattr(fact, "period", None)
+    if p is None:
+        return "instant"  # pragmatic default
+    if getattr(p, "instant", None) is not None:
+        return "instant"
+    return "duration"
 
-    if raw_facts is None:
-        return None
+def _period_dates(fact) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    """Return (bs_date, period_end) where each may be None."""
+    p = getattr(fact, "period", None)
+    bs_date = None
+    pe = None
+    if p is not None:
+        if getattr(p, "instant", None) is not None:
+            bs_date = pd.to_datetime(p.instant, errors="coerce")
+        else:
+            pe = pd.to_datetime(getattr(p, "end", None), errors="coerce")
+    return (bs_date, pe)
 
-    for f in raw_facts:
-        # f may be simple dataclass-like; use getattr then fallback to dict
-        concept = getattr(f, "name", None) or getattr(f, "concept", None)
-        if concept is None and isinstance(f, dict):
-            concept = f.get("name") or f.get("concept")
+# ---- Concept synonyms across FRS102/105, UK-GAAP, IFRS --------------------
+CONCEPTS: Dict[str, List[str]] = {
+    # balance sheet
+    "tangible_fixed_assets": [
+        "frs102:TangibleFixedAssets",
+        "uk-gaap:TangibleFixedAssets",
+        "uk-gaap:PropertyPlantAndEquipment",
+        "ifrs-full:PropertyPlantAndEquipment",
+    ],
+    "debtors": [
+        "frs102:Debtors",
+        "uk-gaap:Debtors",
+        "uk-gaap:TradeAndOtherReceivables",
+        "ifrs-full:TradeAndOtherReceivables",
+    ],
+    "cash_bank_in_hand": [
+        "frs102:CashBankInHand",
+        "uk-gaap:CashBankInHand",
+        "uk-gaap:CashAndCashEquivalents",
+        "ifrs-full:CashAndCashEquivalents",
+    ],
+    "current_assets": [
+        "frs102:CurrentAssets", "uk-gaap:CurrentAssets", "ifrs-full:CurrentAssets",
+    ],
+    "creditors_due_within_one_year": [
+        "frs102:CreditorsAmountsFallingDueWithinOneYear",
+        "uk-gaap:CreditorsDueWithinOneYear",
+        "uk-gaap:CurrentTradeAndOtherPayables",
+        "ifrs-full:TradeAndOtherCurrentPayables",
+    ],
+    "creditors_due_after_one_year": [
+        "frs102:CreditorsAmountsFallingDueAfterMoreThanOneYear",
+        "uk-gaap:CreditorsDueAfterOneYear",
+        "ifrs-full:NoncurrentTradeAndOtherPayables",
+    ],
+    "net_current_assets_liabilities": [
+        "frs102:NetCurrentAssetsLiabilities",
+        "uk-gaap:NetCurrentAssetsLiabilities",
+        "ifrs-full:NetCurrentAssetsLiabilities",
+    ],
+    "total_assets_less_current_liabilities": [
+        "frs102:TotalAssetsLessCurrentLiabilities",
+        "uk-gaap:TotalAssetsLessCurrentLiabilities",
+        "ifrs-full:TotalAssetsLessCurrentLiabilities",
+    ],
+    "net_assets_liabilities_including_pension_asset_liability": [
+        "frs102:NetAssetsLiabilitiesIncludingPensionAssetLiability",
+        "uk-gaap:NetAssetsLiabilitiesIncludingPensionAssetLiability",
+        "ifrs-full:Equity",  # pragmatic stand-in for net assets
+    ],
+    "called_up_share_capital": [
+        "frs102:CalledUpShareCapitalPresentedWithinEquity",
+        "uk-gaap:CalledUpShareCapital",
+        "uk-gaap:CalledUpShareCapitalNotPaid",
+        "ifrs-full:IssuedCapital",
+    ],
 
-        value = getattr(f, "value", None)
-        if value is None and isinstance(f, dict):
-            value = f.get("value")
+    # p&l
+    "turnover_gross_operating_revenue": [
+        "frs102:TurnoverGrossOperatingRevenue",
+        "uk-gaap:TurnoverGrossOperatingRevenue",
+        "ifrs-full:Revenue",
+    ],
+    "other_operating_income": [
+        "frs102:OtherOperatingIncome", "uk-gaap:OtherOperatingIncome", "ifrs-full:OtherOperatingIncome",
+    ],
+    "cost_sales": ["frs102:CostOfSales", "uk-gaap:CostOfSales", "ifrs-full:CostOfSales"],
+    "gross_profit_loss": ["frs102:GrossProfitLoss", "uk-gaap:GrossProfitLoss", "ifrs-full:GrossProfitLoss"],
+    "administrative_expenses": [
+        "frs102:AdministrativeExpenses", "uk-gaap:AdministrativeExpenses", "ifrs-full:AdministrativeExpense",
+    ],
+    "raw_materials_consumables": [
+        "frs102:RawMaterialsAndConsumables", "uk-gaap:RawMaterialsAndConsumables",
+        "ifrs-full:RawMaterialsAndConsumablesUsed",
+    ],
+    "staff_costs": ["frs102:StaffCosts", "uk-gaap:StaffCosts", "ifrs-full:EmployeeBenefitsExpense"],
+    "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets": [
+        "frs102:DepreciationAmortisationAndImpairment",
+        "uk-gaap:DepreciationAmortisationAndImpairment",
+        "ifrs-full:DepreciationAndAmortisationExpense",
+    ],
+    "other_operating_charges_format2": [
+        "frs102:OtherOperatingCharges", "uk-gaap:OtherOperatingCharges", "ifrs-full:OtherOperatingExpense",
+    ],
+    "operating_profit_loss": [
+        "frs102:OperatingProfitLoss", "uk-gaap:OperatingProfitLoss", "ifrs-full:ProfitLossFromOperatingActivities",
+    ],
+    "profit_loss_on_ordinary_activities_before_tax": [
+        "frs102:ProfitLossOnOrdinaryActivitiesBeforeTax", "uk-gaap:ProfitLossOnOrdinaryActivitiesBeforeTax",
+        "ifrs-full:ProfitLossBeforeTax",
+    ],
+    "tax_on_profit_or_loss_on_ordinary_activities": [
+        "frs102:TaxOnProfitLossOnOrdinaryActivities", "uk-gaap:TaxOnProfitLossOnOrdinaryActivities",
+        "ifrs-full:IncomeTaxExpenseContinuingOperations",
+    ],
+    "profit_loss_for_period": [
+        "frs102:ProfitLossForPeriod", "uk-gaap:ProfitLossForPeriod", "ifrs-full:ProfitLoss",
+    ],
+}
 
-        ctx = getattr(f, "context", None)
-        if ctx is None and isinstance(f, dict):
-            ctx = f.get("context")
+_PANDL_LOGICALS = {
+    "turnover_gross_operating_revenue", "other_operating_income", "cost_sales",
+    "gross_profit_loss", "administrative_expenses", "raw_materials_consumables",
+    "staff_costs", "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+    "other_operating_charges_format2", "operating_profit_loss",
+    "profit_loss_on_ordinary_activities_before_tax",
+    "tax_on_profit_or_loss_on_ordinary_activities", "profit_loss_for_period",
+}
 
-        period = None
-        if ctx is not None:
-            period = getattr(ctx, "period", None) if not isinstance(ctx, dict) else ctx.get("period")
+# --------------------------------------------------------------------------------------
+# iXBRL fact picking
+# --------------------------------------------------------------------------------------
 
-        ptype = getattr(period, "type", None) if period is not None and not isinstance(period, dict) else (period.get("type") if isinstance(period, dict) else None)
-        instant = getattr(period, "instant", None) if period is not None and not isinstance(period, dict) else (period.get("instant") if isinstance(period, dict) else None)
-        end = getattr(period, "end", None) if period is not None and not isinstance(period, dict) else (period.get("end") if isinstance(period, dict) else None)
+def _pick_fact(doc, qnames: List[str], prefer: str) -> Tuple[Optional[float], Optional[dict], Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    """
+    prefer: "instant" or "duration"
+    Returns (value, meta, balance_sheet_date, period_end)
+    """
+    candidates: List[Tuple[str, object]] = []
+    for f in getattr(doc, "facts", []):
+        if f.name in qnames:
+            candidates.append((_period_type(f), f))
 
-        facts.append({
-            "concept": concept,
-            "value": value,
-            "context": {"period": {"type": ptype, "instant": instant, "end": end}},
-        })
-    return facts
+    if not candidates:
+        return None, None, None, None
 
-# ---------------------- per-file extraction into a row ----------------------
-def _extract_from_ixbrl_bytes(data: bytes, zip_url: str, run_code: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {c: None for c in TARGET_COLUMNS}
-    out["zip_url"] = zip_url
-    out["run_code"] = run_code
-    out["file_type"] = "ixbrl-html"
-    out["taxonomy"] = None
-    out["error"] = ""
+    # Put preferred period type first; if multiple, pick last in doc (often the final audited value)
+    candidates.sort(key=lambda t: (t[0] != prefer,))
+    fact = candidates[0][1]
 
-    facts = _read_ixbrl_facts(data)
-    if facts is None:
-        out["error"] = "ixbrlparse:unavailable_or_failed"
-        return out
+    val = _scale_by_decimals(_to_float(fact.value), getattr(fact, "decimals", None))
+    bs_date, pe = _period_dates(fact)
+    meta = {
+        "name": fact.name,
+        "period": _period_type(fact),
+        "decimals": getattr(fact, "decimals", None),
+        "unit": getattr(fact, "unit", None),
+    }
+    return val, meta, bs_date, pe
 
-    # Meta fields (best-effort)
-    def first_from(candidates: List[str]) -> Optional[Any]:
-        for name in candidates:
-            v = _first_match_from_facts(facts, [name])
-            if v is not None:
-                return v
-        return None
+def get_number(doc, logical_name: str, debug: bool = False) -> Tuple[Optional[float], Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    qnames = CONCEPTS.get(logical_name, [])
+    prefer = "duration" if logical_name in _PANDL_LOGICALS else "instant"
+    val, meta, bs_date, pe = _pick_fact(doc, qnames, prefer)
+    if debug and meta:
+        print(f"[debug] {logical_name:<55} <= {meta['name']} ({meta['period']}, dec={meta['decimals']}, unit={meta['unit']}) -> {val}")
+    return val, bs_date, pe
 
-    # IDs / names
-    ch_raw = first_from(COMPANY_NO_CONCEPTS)
-    if isinstance(ch_raw, str):
-        ch_digits = re.sub(r"[^0-9]", "", ch_raw or "")
-        out["companies_house_registered_number"] = ch_digits or None
-    elif ch_raw is not None:
-        out["companies_house_registered_number"] = re.sub(r"[^0-9]", "", str(ch_raw)) or None
+# --------------------------------------------------------------------------------------
+# Zip traversal and per-file parsing
+# --------------------------------------------------------------------------------------
 
-    out["entity_current_legal_name"] = first_from(ENTITY_NAME_CONCEPTS)
+@dataclass
+class InnerFile:
+    name: str
+    bytes: bytes
 
-    # Dates
-    inc = first_from(INCORP_DATE_CONCEPTS)
-    per_start = first_from(PERIOD_START_CONCEPTS)
-    per_end = first_from(PERIOD_END_CONCEPTS)
-    bs_date = first_from(BALSHEET_DATE_CONCEPTS)
+def _iter_ixbrl_files_from_zip(z: zipfile.ZipFile) -> Iterator[InnerFile]:
+    """
+    Yields iXBRL HTML files from a zip. If the archive contains nested zip(s),
+    it descends one level and yields any .htm/.html inside.
+    """
+    for info in z.infolist():
+        n = info.filename
+        # Raw iXBRL files
+        if n.lower().endswith((".htm", ".html", ".xhtml")):
+            with z.open(info) as f:
+                yield InnerFile(name=n, bytes=f.read())
+            continue
 
-    # normalize date strings
-    def norm_date(x):
-        try:
-            return pd.to_datetime(x, errors="coerce").date().isoformat()
-        except Exception:
-            return None
+        # Nested daily zips
+        if n.lower().endswith(".zip"):
+            with z.open(info) as f:
+                nested_bytes = f.read()
+            try:
+                with zipfile.ZipFile(io.BytesIO(nested_bytes)) as nz:
+                    for nf in nz.infolist():
+                        nn = nf.filename
+                        if nn.lower().endswith((".htm", ".html", ".xhtml")):
+                            with nz.open(nf) as ff:
+                                yield InnerFile(name=f"{n}::{nn}", bytes=ff.read())
+            except zipfile.BadZipFile:
+                # Skip unreadable inner zips; it's common to have non-iXBRL attachments.
+                continue
 
-    out["date"] = norm_date(per_end) or norm_date(bs_date)
-    out["incorporation_date"] = norm_date(inc)
-    out["period_start"] = norm_date(per_start)
-    out["period_end"] = norm_date(per_end)
-    out["balance_sheet_date"] = norm_date(bs_date)
+def _parse_one_ixbrl(file_bytes: bytes, *, run_code: str, zip_url: str) -> Dict[str, object]:
+    """
+    Parse a single iXBRL HTML bytes blob into a row dict following TARGET_COLUMNS.
+    Missing values are returned as None. Any extraction errors are captured in 'error'.
+    """
+    row: Dict[str, object] = {c: None for c in TARGET_COLUMNS}
+    row["run_code"] = run_code
+    row["zip_url"] = zip_url
+    row["file_type"] = "ixbrl-htm"
 
-    # Flags / simple numerics
-    dormant = first_from(BOOL_DORMANT_CONCEPTS)
-    out["company_dormant"] = (str(dormant).strip().lower() in ("true", "1", "yes")) if dormant is not None else None
+    try:
+        doc = IXBRL(io.BytesIO(file_bytes)).parse()
 
-    avg_emp = _to_float(first_from(AVG_EMPLOYEES_CONCEPTS))
-    out["average_number_employees_during_period"] = avg_emp
+        # Basic metadata commonly present in doc
+        # (Best effort; different filers expose these in different ways)
+        row["taxonomy"] = getattr(doc, "taxonomy", None)
 
-    # Hints for picking best facts
-    period_end_hint = out["period_end"]
-    instant_hint = out["balance_sheet_date"] or out["period_end"]
+        # Known identity facts
+        # CH number
+        for cand in ("frs102:CompaniesHouseRegisteredNumber", "uk-gaap:CompaniesHouseRegisteredNumber", "ch:CompaniesHouseRegisteredNumber"):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["companies_house_registered_number"] = str(v[0].value).strip()
+                break
+        row["company_id"] = row.get("companies_house_registered_number")
 
-    # Financial numerics (robust selection)
-    for norm in (BALANCE_SHEET_NORMALIZED | PNL_NORMALIZED):
-        syn = list(CONCEPT_SYNONYMS.get(norm, []))
-        # also try direct CamelCase of snake name
-        camel = "".join([p.capitalize() for p in norm.split("_")])
-        if camel not in syn:
-            syn.append(camel)
-        want_instant = (norm in BALANCE_SHEET_NORMALIZED)
-        val = _best_numeric_fact(
-            facts, syn, want_instant=want_instant,
-            period_end_hint=period_end_hint, instant_hint=instant_hint
-        )
-        if val is not None:
-            out[norm] = val
+        # Company name
+        for cand in ("entity:EntityCurrentLegalName", "frs102:EntityCurrentLegalName", "uk-gaap:EntityCurrentLegalName", "ifrs-full:NameOfReportingEntityOrOtherMeansOfIdentification"):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["entity_current_legal_name"] = str(v[0].value).strip()
+                break
 
-    return out
+        # Dormant flag (best-effort)
+        for cand in ("frs102:Dormant", "uk-gaap:Dormant", "ch:Dormant"):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["company_dormant"] = str(v[0].value).strip().lower() in ("true", "1", "yes")
+                break
 
-# ------------------------- daily zip parsing (entry) -------------------------
+        # SIC (may be in metadata; optional)
+        for cand in ("ch:SICCode", "uk-gaap:SicCode", "frs102:SicCode"):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["sic_code"] = _to_float(v[0].value)
+                break
+
+        # Incorporation date (rare in accounts; best-effort)
+        for cand in ("ch:IncorporationDate",):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["incorporation_date"] = pd.to_datetime(v[0].value, errors="coerce")
+                break
+
+        # Employees (duration)
+        for cand in ("frs102:AverageNumberEmployeesDuringPeriod", "uk-gaap:AverageNumberEmployeesDuringPeriod", "ifrs-full:AverageNumberOfEmployees"):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["average_number_employees_during_period"] = _to_float(v[0].value)
+                break
+
+        # Extract numbers for each logical field
+        # keep track of balance_sheet_date / period_end as we go
+        bs_dates: List[pd.Timestamp] = []
+        period_ends: List[pd.Timestamp] = []
+
+        def set_num(field: str):
+            val, bs, pe = get_number(doc, field, debug=False)
+            row[field] = val
+            if bs is not None:
+                bs_dates.append(bs)
+            if pe is not None:
+                period_ends.append(pe)
+
+        numeric_fields = [
+            # balance sheet
+            "tangible_fixed_assets", "debtors", "cash_bank_in_hand", "current_assets",
+            "creditors_due_within_one_year", "creditors_due_after_one_year",
+            "net_current_assets_liabilities", "total_assets_less_current_liabilities",
+            "net_assets_liabilities_including_pension_asset_liability", "called_up_share_capital",
+            # p&l
+            "turnover_gross_operating_revenue", "other_operating_income", "cost_sales",
+            "gross_profit_loss", "administrative_expenses", "raw_materials_consumables",
+            "staff_costs", "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+            "other_operating_charges_format2", "operating_profit_loss",
+            "profit_loss_on_ordinary_activities_before_tax",
+            "tax_on_profit_or_loss_on_ordinary_activities", "profit_loss_for_period",
+        ]
+        for f in numeric_fields:
+            set_num(f)
+
+        # deduce balance sheet date / period dates from any extracted fact
+        row["balance_sheet_date"] = min(bs_dates) if bs_dates else None
+        row["period_end"] = max(period_ends) if period_ends else None
+
+        # For completeness, set a generic 'date' column:
+        row["date"] = row["balance_sheet_date"] or row["period_end"]
+
+        # Company type (best-effort: often appears in metadata)
+        for cand in ("ch:CompanyType", "uk-gaap:CompanyType"):
+            v = doc.facts_by_name.get(cand) if hasattr(doc, "facts_by_name") else None
+            if v:
+                row["company_type"] = str(v[0].value)
+                break
+
+    except Exception as e:
+        row["error"] = f"{type(e).__name__}: {e}"
+
+    return row
+
+# --------------------------------------------------------------------------------------
+# Public entry used by bulk and by the daily job runner
+# --------------------------------------------------------------------------------------
+
 def _parse_daily_zip(zip_path: str, zip_url: str, run_code: str) -> pd.DataFrame:
     """
-    Parse a "daily" Companies House accounts zip (or a parent that contains daily zips).
-    Returns a DataFrame with TARGET_COLUMNS.
+    Parse a Companies House *daily* zip (or a monthly zip that contains daily zips),
+    returning a DataFrame with TARGET_COLUMNS.
+    - zip_path: local .zip file path
+    - zip_url:  source URL (used for provenance in 'zip_url')
+    - run_code: free-form provenance label (e.g. '2025-01-15' or '2025-01')
     """
-    rows: List[Dict[str, Any]] = []
-
-    def _maybe_parse_html_bytes(b: bytes):
-        row = _extract_from_ixbrl_bytes(b, zip_url=zip_url, run_code=run_code)
-        rows.append(row)
+    rows: List[Dict[str, object]] = []
 
     with zipfile.ZipFile(zip_path, "r") as z:
-        for info in z.infolist():
-            fname = info.filename
-            # nested zips: recurse once
-            if fname.lower().endswith(".zip"):
-                with z.open(info) as nested_fp:
-                    nested_bytes = nested_fp.read()
-                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
-                    tf.write(nested_bytes)
-                    nested_path = tf.name
-                try:
-                    with zipfile.ZipFile(nested_path, "r") as z2:
-                        for inner in z2.infolist():
-                            if inner.filename.lower().endswith((".html", ".htm", ".xhtml")):
-                                with z2.open(inner) as f:
-                                    _maybe_parse_html_bytes(f.read())
-                except Exception:
-                    # ignore bad nested archives
-                    continue
-            elif fname.lower().endswith((".html", ".htm", ".xhtml")):
-                with z.open(info) as f:
-                    _maybe_parse_html_bytes(f.read())
+        for inner in _iter_ixbrl_files_from_zip(z):
+            try:
+                row = _parse_one_ixbrl(inner.bytes, run_code=run_code, zip_url=zip_url)
+                rows.append(row)
+            except Exception as e:
+                rows.append({
+                    **{c: None for c in TARGET_COLUMNS},
+                    "run_code": run_code,
+                    "zip_url": zip_url,
+                    "file_type": "ixbrl-htm",
+                    "error": f"{type(e).__name__}: {e}",
+                })
 
     if not rows:
+        # Return a well-formed empty frame
         return pd.DataFrame(columns=TARGET_COLUMNS)
 
-    df = pd.DataFrame(rows)
-    # ensure all target columns exist
-    for c in TARGET_COLUMNS:
-        if c not in df.columns:
-            df[c] = None
+    df = pd.DataFrame(rows)[TARGET_COLUMNS]
 
-    # Diagnostics: show which metrics populated in this batch
-    numeric_cols = [c for c in TARGET_COLUMNS if c not in {
-        "run_code","companies_house_registered_number","date","file_type","taxonomy","balance_sheet_date",
-        "entity_current_legal_name","company_dormant","average_number_employees_during_period",
-        "period_start","period_end","error","zip_url"
-    }]
-    if not df.empty:
-        nn = df[numeric_cols].notna().sum().sort_values(ascending=False)
-        print("[ixbrl_fetch_daily] non-null counts (top 10):")
-        print(nn.head(10).to_string())
+    # ---- Diagnostics printed into Action logs (helps choose numeric ranges)
+    cols_of_interest = [
+        "tangible_fixed_assets","debtors","cash_bank_in_hand","current_assets",
+        "creditors_due_within_one_year","creditors_due_after_one_year",
+        "net_current_assets_liabilities","total_assets_less_current_liabilities",
+        "net_assets_liabilities_including_pension_asset_liability","called_up_share_capital",
+        "turnover_gross_operating_revenue","other_operating_income","cost_sales","gross_profit_loss",
+        "administrative_expenses","raw_materials_consumables","staff_costs",
+        "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+        "other_operating_charges_format2","operating_profit_loss",
+        "profit_loss_on_ordinary_activities_before_tax",
+        "tax_on_profit_or_loss_on_ordinary_activities","profit_loss_for_period",
+    ]
+    present = [c for c in cols_of_interest if c in df.columns]
+    if present:
+        nn = df[present].notna().sum().sort_values(ascending=False).head(12)
+        print(f"[ixbrl_fetch_daily] non-null counts (top 12) for run {run_code}:")
+        for k, v in nn.items():
+            print(f"  {k:55s} {v}")
 
-    # Return only the schema columns (order fixed)
-    return df[TARGET_COLUMNS]
+    return df
