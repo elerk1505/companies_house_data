@@ -1,0 +1,30 @@
+name: Sample Monthly iXBRL
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Monthly archive URL"
+        required: true
+        type: string
+      limit:
+        description: "Max inner ixbrl files to parse"
+        required: false
+        default: "200"
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install ixbrlparse requests
+      - name: Run sampler
+        env:
+          LIMIT_FILES: ${{ github.event.inputs.limit }}
+        run: |
+          python scripts/sample_ixbrl_month.py "${{ github.event.inputs.url }}"
