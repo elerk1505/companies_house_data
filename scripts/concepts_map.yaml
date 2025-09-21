@@ -1,0 +1,60 @@
+# scripts/concepts_map.yaml
+run_code: []                    # filled by your pipeline
+company_id:
+  - ns10:UKCompaniesHouseRegisteredNumber
+  - bus:UKCompaniesHouseRegisteredNumber
+  - uk-bus:UKCompaniesHouseRegisteredNumber
+entity_current_legal_name:
+  - bus:EntityCurrentLegalRegisteredName
+  - uk-bus:EntityCurrentLegalRegisteredName
+balance_sheet_date:
+  - bus:BalanceSheetDate         # seen in several months
+period_start:
+  - bus:StartDateForPeriodCoveredByReport
+period_end:
+  - bus:EndDateForPeriodCoveredByReport
+
+# Balance-sheet numerics
+cash_bank_in_hand:
+  - core:CashBankOnHand
+  - ns5:CashBankOnHand
+debtors:
+  - core:Debtors
+  - ns5:Debtors
+current_assets:
+  - core:CurrentAssets
+  - ns5:CurrentAssets
+creditors_due_within_one_year:
+  - ns5:CreditorsDueWithinOneYear
+  - core:Creditors
+net_current_assets_liabilities:
+  - core:NetCurrentAssetsLiabilities
+  - ns5:NetCurrentAssetsLiabilities
+  - uk-gaap-pt:NetCurrentAssetsLiabilities
+  - uk-gaap:NetCurrentAssetsLiabilities
+total_assets_less_current_liabilities:
+  - core:TotalAssetsLessCurrentLiabilities
+  - ns5:TotalAssetsLessCurrentLiabilities
+  - uk-gaap-pt:TotalAssetsLessCurrentLiabilities
+  - uk-gaap:TotalAssetsLessCurrentLiabilities
+net_assets_liabilities_including_pension_asset_liability:
+  - uk-gaap:NetAssetsLiabilitiesIncludingPensionAssetLiability
+  - core:NetAssetsLiabilities
+tangible_fixed_assets:
+  - ns5:TangibleFixedAssets
+  - uk-gaap-pt:TangibleFixedAssets
+  - core:PropertyPlantEquipment
+
+# Equity bits (seen frequently)
+called_up_share_capital:
+  - ns5:CalledUpShareCapital
+  - uk-gaap-pt:ShareholderFunds   # fallback in older sets
+shareholder_funds:
+  - ns5:ShareholderFunds
+  - core:Equity
+  - ns5:Equity
+
+# Optional common extras you surfaced
+creditors:
+  - core:Creditors
+  - ns5:Creditors
