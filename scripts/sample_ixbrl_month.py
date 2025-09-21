@@ -17,20 +17,18 @@ def open_ixbrl_bytes(b: bytes):
 
 def iter_ixbrl_members(z: zipfile.ZipFile):
     for info in z.infolist():
-        name = info.filename
-        low = name.lower()
-        if low.endswith(".html") or low.endswith(".htm") or low.endswith(".xhtml"):
-            # likely ixbrl leaf
-            yield info
-        elif low.endswith(".zip"):
-            # nested daily zip
+        name = info.filename.lower()
+        if name.endswith((".html", ".htm", ".xhtml")):
+            yield z.open(info).read()
+        elif name.endswith(".zip"):
+            # Nested daily zip
             with z.open(info) as f:
                 data = f.read()
             with zipfile.ZipFile(io.BytesIO(data), "r") as z2:
-                for info2 in z2.infolist():
-                    low2 = info2.filename.lower()
-                    if low2.endswith(".html") or low2.endswith(".htm") or low2.endswith(".xhtml"):
-                        yield (info, info2)  # (outer, inner)
+                for inner in z2.infolist():
+                    iname = inner.filename.lower()
+                    if iname.endswith((".html", ".htm", ".xhtml")):
+                        yield z2.open(inner).read()
 
 def concept_key(fact) -> str:
     # Prefer qname including prefix/namespace, fall back to localname
@@ -59,17 +57,28 @@ def main():
     sample_vals: Dict[str, Tuple[int, str]] = {}
 
     with zipfile.ZipFile(io.BytesIO(r.content), "r") as z:
-        for member in iter_ixbrl_members(z):
-            if isinstance(member, tuple):
-                outer, inner = member
-                with z.open(outer) as f:
-                    b = f.read()
-                with zipfile.ZipFile(io.BytesIO(b), "r") as z2:
-                    with z2.open(inner) as g:
-                        html = g.read()
-            else:
-                with z.open(member) as f:
-                    html = f.read()
+        for html in iter_ixbrl_members(z):
+    try:
+        doc = open_ixbrl_bytes(html)
+    except Exception:
+        continue
+
+    # Walk all facts
+    for fact in doc.facts:
+        if not is_numeric_fact(fact):
+            continue
+        key = concept_key(fact)
+        counts[key] += 1
+        if key not in sample_vals:
+            sample_vals[key] = (1, str(fact.value))
+        else:
+            c, _ = sample_vals[key]
+            if c < 3:
+                sample_vals[key] = (c + 1, str(fact.value))
+
+    seen += 1
+    if seen >= LIMIT_FILES:
+        break
 
             try:
                 doc = open_ixbrl_bytes(html)
