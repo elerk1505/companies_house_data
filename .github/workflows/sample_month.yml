@@ -1,22 +1,25 @@
-name: Sample Monthly Diagnostics
+name: Sample Monthly Concepts
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Monthly/daily archive .zip URL (e.g. https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-January2020.zip)"
+        description: "Monthly archive URL (e.g., https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip)"
         required: true
         type: string
       limit:
-        description: "Max inner iXBRL files to parse (0 = all)"
+        description: "Max HTML files to scan"
         required: false
-        default: "200"
+        default: "300"
         type: string
-      out:
-        description: "Optional output path (parquet or csv), e.g. out/fin_sample.parquet"
+      mincount:
+        description: "Only show concepts appearing at least this many times (console)"
         required: false
-        default: ""
+        default: "5"
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   run:
@@ -24,38 +27,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install lxml pandas pyarrow requests
+          python -m pip install -U pip
+          python -m pip install requests pandas beautifulsoup4 lxml
 
       - name: Run diagnostics
-        env:
-          URL: ${{ github.event.inputs.url }}
-          LIMIT: ${{ github.event.inputs.limit }}
-          OUT: ${{ github.event.inputs.out }}
         run: |
           set -e
-          echo "URL=$URL"
-          echo "LIMIT=$LIMIT"
-          echo "OUT=$OUT"
-          if [ -z "$OUT" ]; then
-            python scripts/sample_ixbrl_month.py --input "$URL" --max "$LIMIT"
-          else
-            python scripts/sample_ixbrl_month.py --input "$URL" --max "$LIMIT" --out "$OUT"
-          fi
+          python scripts/sample_ixbrl_month.py \
+            --url "${{ inputs.url }}" \
+            --limit "${{ inputs.limit }}" \
+            --mincount "${{ inputs.mincount }}"
 
-      - name: Upload artifact (if output was written)
-        if: ${{ github.event.inputs.out != '' }}
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: fin-sample
+          name: ixbrl-concepts
           path: |
-            ${{ github.event.inputs.out }}
-            ${{ github.event.inputs.out }}.csv
-            ${{ github.event.inputs.out }}.parquet
-          if-no-files-found: ignore
+            concept_counts.csv
+            concept_samples.txt
+          if-no-files-found: warn
