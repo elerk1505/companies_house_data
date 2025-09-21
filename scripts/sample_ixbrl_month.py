@@ -1,175 +1,341 @@
 #!/usr/bin/env python3
-# scripts/sample_ixbrl_month.py
+# -*- coding: utf-8 -*-
+"""
+Bulk iXBRL extractor with diagnostics (URL or local .zip).
+
+- Input: a Companies House daily/monthly ZIP **URL** (or local zip path)
+- Recursively scans: monthly.zip -> (daily.zip)* -> *.html / *.htm / *.xhtml / *.xhtml.gz
+- Extracts identifiers, dates, and common financial fields
+- Prints:
+    • non-null counts for mapped fields
+    • "Top unmapped numeric tags" (tag -> count, sample value)
+- Optional: write extracted rows to Parquet/CSV (use --out)
+
+Usage examples:
+  python scripts/ixbrl_bulk_parse_with_diagnostics.py --input "https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-January2020.zip" --max 500
+  python scripts/ixbrl_bulk_parse_with_diagnostics.py --input "/path/to/Accounts_Bulk_Data-2025-09-18.zip" --out out/fin_sample.parquet
+"""
 from __future__ import annotations
 
-import sys
 import io
+import os
+import re
+import sys
+import gzip
 import zipfile
+import argparse
+from collections import Counter
+from typing import Dict, Iterable, Tuple, List, Optional
+
 import requests
-import collections
-from typing import Dict, Tuple, Iterable, Optional
+from lxml import etree
+import pandas as pd
 
-# pip install ixbrlparse (already done in your workflows)
-try:
-    from ixbrlparse import IXBRL
-except Exception as e:
-    print("[error] ixbrlparse is required: pip install ixbrlparse", file=sys.stderr)
-    raise
+# ------------------------
+# Helpers
+# ------------------------
 
+NUM_RE = re.compile(r"[-+]?\d[\d,.\s]*")
+CURRENCY_JUNK = re.compile(r"[^\d.\-+]")
 
-# ---------- Helpers ----------
-
-def open_ixbrl_bytes(html_bytes: bytes) -> IXBRL:
-    """
-    Create an IXBRL document from raw HTML bytes.
-    """
-    return IXBRL(html_bytes)
-
-
-def _looks_numeric(s: str) -> bool:
-    """
-    Heuristic: says whether text looks like a numeric value (allowing commas, signs, decimals).
-    """
-    if s is None:
-        return False
-    s = str(s).strip()
-    if not s or s.lower() in ("nil", "nan", "inf", "-inf"):
-        return False
-    # common placeholders that aren't numbers
-    if s in ("—", "–", "-", "—", "— —"):
-        return False
-    # Try a forgiving parse
+def clean_numeric(text: str) -> Optional[float]:
+    if text is None:
+        return None
+    t = str(text).strip().replace("\u00A0", " ")
+    neg = False
+    if t.startswith("(") and t.endswith(")"):
+        neg, t = True, t[1:-1]
+    t = CURRENCY_JUNK.sub("", t)
+    if not t or not re.search(r"\d", t):
+        return None
     try:
-        float(s.replace(",", ""))
-        return True
+        val = float(t.replace(",", ""))
+        return -val if neg else val
     except Exception:
-        return False
+        return None
 
+def text_or_none(el: etree._Element) -> Optional[str]:
+    if el is None:
+        return None
+    t = "".join(el.itertext()).strip()
+    return t or None
 
-def is_numeric_fact(fact) -> bool:
-    """
-    Decide if an ixbrlparse fact is numeric enough for sampling.
-    We avoid depending on internal library attributes and just check value-like-ness.
-    """
-    # ixbrlparse exposes .value; sometimes also .unit / .decimals etc
-    v = getattr(fact, "value", None)
-    if v is None:
-        return False
-    return _looks_numeric(v)
+def qname(el: etree._Element) -> str:
+    # Prefer the XBRL "name" attr on ix:nonFraction/ix:nonNumeric; else element's local-name
+    nattr = el.get("name")
+    if nattr:
+        return nattr
+    if el.tag and "}" in el.tag:
+        return el.tag.split("}", 1)[1]
+    return el.tag
 
+def is_numeric_ix_fact(el: etree._Element) -> bool:
+    if el.tag.endswith("nonFraction"):
+        return True
+    if el.tag.endswith("nonNumeric"):
+        return clean_numeric(text_or_none(el)) is not None
+    return False
 
-def concept_key(fact) -> str:
-    """
-    Build a stable concept key (e.g., with QName if available).
-    """
-    # Try several common attributes seen in ixbrl libs
-    for attr in ("qname", "name", "concept", "concept_name"):
-        val = getattr(fact, attr, None)
-        if val:
-            return str(val)
-    # Fallback to string of the fact's concept-like repr
-    return str(getattr(fact, "concept", "UNKNOWN_CONCEPT"))
+def iter_ix_facts(doc: etree._ElementTree) -> Iterable[etree._Element]:
+    # Match ix facts regardless of namespace prefix
+    xpath = "//*[local-name()='nonFraction' or local-name()='nonNumeric']"
+    for el in doc.xpath(xpath):
+        yield el
 
+def load_bytes(path_or_url: str) -> bytes:
+    if path_or_url.startswith(("http://", "https://")):
+        print(f"[info] downloading: {path_or_url}")
+        r = requests.get(path_or_url, timeout=600)
+        r.raise_for_status()
+        return r.content
+    with open(path_or_url, "rb") as f:
+        return f.read()
 
-def iter_ixbrl_members(z: zipfile.ZipFile) -> Iterable[bytes]:
-    """
-    Yield raw HTML bytes for every iXBRL file found in the monthly archive.
-    Handles both top-level .html/.htm/.xhtml and one level of nested .zip (daily bundles).
-    """
-    def is_ixbrl_name(name: str) -> bool:
-        n = name.lower()
-        return n.endswith(".html") or n.endswith(".htm") or n.endswith(".xhtml")
+def _looks_like_zip(name: str) -> bool:
+    return name.lower().endswith(".zip")
 
-    for info in z.infolist():
-        name = info.filename
-        lname = name.lower()
+def _looks_like_ixbrl(name: str) -> bool:
+    n = name.lower()
+    return n.endswith((".html", ".htm", ".xhtml", ".xhtml.gz"))
+
+def _read_member_to_bytes(zf: zipfile.ZipFile, member: zipfile.ZipInfo) -> bytes:
+    with zf.open(member, "r") as fh:
+        blob = fh.read()
+    if member.filename.lower().endswith(".gz"):
         try:
-            if lname.endswith(".zip"):
-                # Nested daily zip: open & scan for HTML
-                with z.open(info) as f:
-                    data = f.read()
-                with zipfile.ZipFile(io.BytesIO(data), "r") as inner:
-                    for inner_info in inner.infolist():
-                        if is_ixbrl_name(inner_info.filename):
-                            try:
-                                with inner.open(inner_info) as g:
-                                    yield g.read()
-                            except Exception:
-                                # Skip problematic file and continue
-                                continue
-            elif is_ixbrl_name(lname):
-                with z.open(info) as f:
-                    yield f.read()
+            return gzip.decompress(blob)
         except Exception:
-            # One bad entry shouldn't kill the run
+            return gzip.GzipFile(fileobj=io.BytesIO(blob)).read()
+    return blob
+
+def iter_html_from_zip_bytes(zip_bytes: bytes, diag_head: int = 40) -> Iterable[Tuple[str, bytes]]:
+    """
+    Yield (name, html_bytes) for any iXBRL HTML found under:
+    monthly.zip -> (daily.zip)* -> (folders)* -> *.html/*.htm/*.xhtml/*.xhtml.gz
+    """
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as monthly:
+        names = monthly.namelist()
+        print(f"[diag] monthly members (first {min(diag_head, len(names))}):")
+        for nm in names[:diag_head]:
+            print(f"  - {nm}")
+
+        for m in monthly.infolist():
+            mname = m.filename
+            if _looks_like_zip(mname):
+                # inner daily zip
+                daily_bytes = _read_member_to_bytes(monthly, m)
+                with zipfile.ZipFile(io.BytesIO(daily_bytes), "r") as daily:
+                    dnames = daily.namelist()
+                    print(f"[diag] daily zip '{mname}' has {len(dnames)} entries; e.g. {dnames[:5]}")
+                    for dmem in daily.infolist():
+                        dname = dmem.filename
+                        if _looks_like_ixbrl(dname):
+                            yield dname, _read_member_to_bytes(daily, dmem)
+            elif _looks_like_ixbrl(mname):
+                # rare: html directly in monthly zip
+                yield mname, _read_member_to_bytes(monthly, m)
+
+# ------------------------
+# Mapping (extend/adjust as needed)
+# ------------------------
+
+ID_MAP = {
+    "bus:UKCompaniesHouseRegisteredNumber": "companies_house_registered_number",
+    "bus:EntityCurrentLegalOrRegisteredName": "entity_current_legal_name",
+    "core:BalanceSheetDate": "balance_sheet_date",
+    "bus:StartDateForPeriodCoveredByReport": "period_start",
+    "bus:EndDateForPeriodCoveredByReport": "period_end",
+}
+
+FIN_MAP = {
+    # Balance sheet / equity
+    "core:CashBankOnHand": "cash_bank_in_hand",
+    "core:Debtors": "debtors",
+    "core:CurrentAssets": "current_assets",
+    "core:CreditorsDueWithinOneYear": "creditors_due_within_one_year",
+    "core:CreditorsAfterOneYear": "creditors_due_after_one_year",
+    "core:NetCurrentAssetsLiabilities": "net_current_assets_liabilities",
+    "core:TotalAssetsLessCurrentLiabilities": "total_assets_less_current_liabilities",
+    "core:NetAssetsLiabilitiesIncludingPensionAssetLiability": "net_assets_liabilities_including_pension_asset_liability",
+    "core:CalledUpShareCapitalPresentedWithinEquity": "called_up_share_capital",
+    "core:ProfitLossAccountReserve": "profit_loss_account_reserve",
+    "core:Equity": "shareholder_funds",
+
+    # P&L (if provided; many filleted accounts omit)
+    "core:TurnoverGrossOperatingRevenue": "turnover_gross_operating_revenue",
+    "core:OtherOperatingIncome": "other_operating_income",
+    "core:CostSales": "cost_sales",
+    "core:GrossProfitLoss": "gross_profit_loss",
+    "core:AdministrativeExpenses": "administrative_expenses",
+    "core:RawMaterialsConsumablesUsed": "raw_materials_consumables",
+    "core:StaffCostsEmployeeBenefitsExpense": "staff_costs",
+    "core:DepreciationAmortisationImpairmentExpense": "depreciation_other_amounts_written_off_tangible_intangible_fixed_assets",
+    "core:OtherOperatingChargesFormat2": "other_operating_charges_format2",
+    "core:OperatingProfitLoss": "operating_profit_loss",
+    "core:ProfitLossBeforeTax": "profit_loss_on_ordinary_activities_before_tax",
+    "core:TaxExpenseContinuingOperations": "tax_on_profit_or_loss_on_ordinary_activities",
+    "core:ProfitLoss": "profit_loss_for_period",
+
+    # Employment
+    "core:AverageNumberEmployeesDuringPeriod": "average_number_employees_during_period",
+}
+
+# Add discovered synonyms here as you find them in the diagnostics
+SYNONYMS = {
+    # "ifrs-full:CashAndCashEquivalents": "cash_bank_in_hand",
+    # "uk-gaap:NetCurrentAssetsLiabilities": "net_current_assets_liabilities",
+}
+FIN_MAP.update(SYNONYMS)
+
+OUTPUT_COLS = [
+    "companies_house_registered_number",
+    "entity_current_legal_name",
+    "balance_sheet_date",
+    "period_start",
+    "period_end",
+] + list(FIN_MAP.values())
+
+# ------------------------
+# Single-file extraction
+# ------------------------
+
+def extract_from_html_bytes(html_bytes: bytes, source_name: str = "") -> Dict[str, object]:
+    row: Dict[str, object] = {c: None for c in OUTPUT_COLS}
+    row["_source"] = source_name
+    row["_unknown_numeric_tags"] = []  # filled with [(tag, sample_value), ...]
+
+    parser = etree.HTMLParser(recover=True, huge_tree=True)
+    try:
+        doc = etree.parse(io.BytesIO(html_bytes), parser=parser)
+    except Exception:
+        try:
+            doc = etree.parse(io.BytesIO(html_bytes), etree.XMLParser(recover=True, huge_tree=True))
+        except Exception:
+            row["_error"] = "parse_failed"
+            return row
+
+    for el in iter_ix_facts(doc):
+        tag = qname(el)
+        txt = text_or_none(el)
+
+        # IDs / dates (keep raw then coerce)
+        if tag in ID_MAP:
+            col = ID_MAP[tag]
+            if row.get(col) is None and txt:
+                row[col] = txt
             continue
 
+        # Numeric
+        if is_numeric_ix_fact(el):
+            val = clean_numeric(txt or "")
+            if val is None:
+                continue
+            if tag in FIN_MAP:
+                col = FIN_MAP[tag]
+                if row.get(col) is None:
+                    row[col] = val
+            else:
+                # collect unknown numeric tags for diagnostics
+                sample = (txt or "").strip().replace("\n", " ")
+                if len(sample) > 100:
+                    sample = sample[:97] + "..."
+                row["_unknown_numeric_tags"].append((tag, sample))
 
-# ---------- Main ----------
+    return row
+
+# ------------------------
+# Bulk runner
+# ------------------------
+
+def coerce_date_strings(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
+def run_bulk(input_path_or_url: str, max_files: int = 0):
+    data = load_bytes(input_path_or_url)
+    if not zipfile.is_zipfile(io.BytesIO(data)):
+        raise ValueError("Input must be a .zip URL or path")
+
+    records: List[Dict[str, object]] = []
+    unk_counter: Counter = Counter()
+    unk_sample: Dict[str, str] = {}
+
+    for i, (name, html_bytes) in enumerate(iter_html_from_zip_bytes(data), start=1):
+        rec = extract_from_html_bytes(html_bytes, source_name=name)
+
+        # gather unknowns
+        for tag, sample in rec.pop("_unknown_numeric_tags", []):
+            unk_counter[tag] += 1
+            if tag not in unk_sample:
+                unk_sample[tag] = sample
+
+        records.append(rec)
+        if max_files and i >= max_files:
+            break
+
+    df = pd.DataFrame.from_records(records)
+    if not df.empty:
+        df = coerce_date_strings(df, ["balance_sheet_date", "period_start", "period_end"])
+    return df, unk_counter, unk_sample
+
+# ------------------------
+# CLI
+# ------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: python scripts/sample_ixbrl_month.py <MONTHLY_ARCHIVE_URL> [LIMIT_FILES]", file=sys.stderr)
-        sys.exit(2)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="CH monthly/daily .zip URL or local .zip path")
+    ap.add_argument("--max", type=int, default=0, help="Stop after N files (0 = all)")
+    ap.add_argument("--out", type=str, default="", help="Optional output file (.parquet or .csv)")
+    ap.add_argument("--topn", type=int, default=40, help="Top N unmapped tags to print")
+    args = ap.parse_args()
 
-    MONTH_URL = sys.argv[1].strip()
-    try:
-        LIMIT_FILES = int(sys.argv[2]) if len(sys.argv) >= 3 else 200
-    except Exception:
-        LIMIT_FILES = 200
+    print(f"[info] scanning: {args.input}")
+    df, unk_counter, unk_sample = run_bulk(args.input, max_files=args.max)
 
-    print(f"[info] downloading: {MONTH_URL}")
-    r = requests.get(MONTH_URL, timeout=600)
-    r.raise_for_status()
+    print(f"[info] parsed files: {len(df)}")
+    if not df.empty:
+        nn = df[OUTPUT_COLS].notna().sum().sort_values(ascending=False)
+        print("\n[diag] non-null counts (top 20):")
+        print(nn.head(20).to_string())
 
-    seen = 0
-    counts: collections.Counter[str] = collections.Counter()
-    sample_vals: Dict[str, Tuple[int, str]] = {}  # concept -> (count_of_samples_kept, example_value)
+    if unk_counter:
+        print("\n[diag] Top unmapped numeric tags:")
+        rows = []
+        for tag, cnt in unk_counter.most_common(args.topn):
+            rows.append({"tag": tag, "count": cnt, "sample_value": unk_sample.get(tag, "")})
+        print(pd.DataFrame(rows).to_string(index=False))
+    else:
+        print("\n[diag] No unmapped numeric tags encountered.")
 
-    with zipfile.ZipFile(io.BytesIO(r.content), "r") as z:
-        for html in iter_ixbrl_members(z):
+    if args.out and not df.empty:
+        out = args.out
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+        low = out.lower()
+        if low.endswith(".parquet"):
             try:
-                doc = open_ixbrl_bytes(html)
+                import pyarrow as pa  # noqa
+                import pyarrow.parquet as pq  # noqa
+                df.to_parquet(out, index=False)
+                print(f"[info] wrote: {out}")
+            except Exception as e:
+                print(f"[warn] pyarrow not available ({e}); writing CSV instead")
+                df.to_csv(out + ".csv", index=False)
+                print(f"[info] wrote: {out}.csv")
+        elif low.endswith(".csv"):
+            df.to_csv(out, index=False)
+            print(f"[info] wrote: {out}")
+        else:
+            # choose parquet if available else csv
+            try:
+                import pyarrow as pa  # noqa
+                df.to_parquet(out + ".parquet", index=False)
+                print(f"[info] wrote: {out}.parquet")
             except Exception:
-                # Skip broken/parsing failures
-                continue
-
-            # Walk all facts in the document
-            facts = getattr(doc, "facts", [])
-            for fact in facts:
-                if not is_numeric_fact(fact):
-                    continue
-                key = concept_key(fact)
-                counts[key] += 1
-
-                # Keep up to 3 example values per concept
-                val_text = str(getattr(fact, "value", ""))
-                if key not in sample_vals:
-                    sample_vals[key] = (1, val_text)
-                else:
-                    c, _ = sample_vals[key]
-                    if c < 3:
-                        sample_vals[key] = (c + 1, val_text)
-
-            seen += 1
-            if seen >= LIMIT_FILES:
-                break
-
-    print(f"\nParsed {seen} iXBRL files (LIMIT_FILES={LIMIT_FILES}).")
-    print(f"Unique numeric concepts found: {len(counts)}\n")
-
-    # Show top concepts
-    TOP_N = 50
-    print(f"Top {min(TOP_N, len(counts))} numeric concepts by frequency:")
-    for i, (k, v) in enumerate(counts.most_common(TOP_N), 1):
-        sample_value = sample_vals.get(k, (0, ""))[1]
-        print(f"{i:2d}. {k:60s}  {v:7d}   sample={sample_value}")
-
-    # If none found, give a hint
-    if not counts:
-        print("\n[hint] No numeric concepts found in the sample. "
-              "Try a different monthly archive (older months often contain richer filings), "
-              "or increase LIMIT_FILES.")
+                df.to_csv(out + ".csv", index=False)
+                print(f"[info] wrote: {out}.csv")
 
 if __name__ == "__main__":
     main()
