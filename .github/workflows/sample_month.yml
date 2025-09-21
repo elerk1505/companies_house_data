@@ -4,22 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Monthly archive URL (e.g., https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip)"
+        description: "Monthly archive URL (e.g. https://download.companieshouse.gov.uk/Accounts_Monthly_Data-January2025.zip or archive/...zip)"
         required: true
         type: string
       limit:
-        description: "Max HTML files to scan"
+        description: "Max inner files to parse"
         required: false
         default: "300"
         type: string
-      mincount:
-        description: "Only show concepts appearing at least this many times (console)"
-        required: false
-        default: "5"
-        type: string
-
-permissions:
-  contents: read
 
 jobs:
   run:
@@ -35,15 +27,17 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install -U pip
-          python -m pip install requests pandas beautifulsoup4 lxml
+          python -m pip install requests lxml
 
       - name: Run diagnostics
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           set -e
-          python scripts/sample_ixbrl_month.py \
-            --url "${{ inputs.url }}" \
-            --limit "${{ inputs.limit }}" \
-            --mincount "${{ inputs.mincount }}"
+          URL="${{ inputs.url }}"
+          LIMIT="${{ inputs.limit }}"
+          echo "[diag] URL=$URL"
+          python scripts/sample_month.py "$URL" "$LIMIT"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
