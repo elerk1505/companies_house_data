@@ -82,13 +82,15 @@ def iter_ixbrl_html_bytes_from_zip(z: zipfile.ZipFile) -> Iterable[Tuple[str, by
         elif lname.endswith(".html") or lname.endswith(".xhtml") or lname.endswith(".htm"):
             yield name, data
 
-def is_ixbrl_tag(tag_name: str) -> bool:
+def is_ixbrl_tag(tag) -> bool:
     """
-    BeautifulSoup drops the prefix (ix:), and lowercases names.
-    iXBRL facts are 'ix:nonFraction' and 'ix:nonNumeric'.
-    We match their local names.
+    Return True if a BeautifulSoup tag is an iXBRL fact.
+    Matches ix:nonFraction and ix:nonNumeric, case-insensitive.
     """
-    t = (tag_name or "").lower()
+    try:
+        t = tag.name.lower()
+    except Exception:
+        return False
     return t.endswith("nonfraction") or t.endswith("nonnumeric")
 
 def kind_for(tag_name: str) -> str:
