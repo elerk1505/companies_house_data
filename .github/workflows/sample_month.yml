@@ -44,9 +44,9 @@ jobs:
           echo "LIMIT=$LIMIT"
           echo "OUT=$OUT"
           if [ -z "$OUT" ]; then
-            python scripts/ixbrl_bulk_parse_with_diagnostics.py --input "$URL" --max "$LIMIT"
+            python scripts/sample_ixbrl_month.py --input "$URL" --max "$LIMIT"
           else
-            python scripts/ixbrl_bulk_parse_with_diagnostics.py --input "$URL" --max "$LIMIT" --out "$OUT"
+            python scripts/sample_ixbrl_month.py --input "$URL" --max "$LIMIT" --out "$OUT"
           fi
 
       - name: Upload artifact (if output was written)
