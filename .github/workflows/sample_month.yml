@@ -37,7 +37,7 @@ jobs:
           URL="${{ inputs.url }}"
           LIMIT="${{ inputs.limit }}"
           echo "[diag] URL=$URL"
-          python scripts/sample_month.py "$URL" "$LIMIT"
+          python scripts/sample_ixbrl_month.py "$URL" "$LIMIT"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
