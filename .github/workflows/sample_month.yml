@@ -1,16 +1,21 @@
-name: Sample Monthly iXBRL
+name: Sample Monthly Diagnostics
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Monthly archive URL"
+        description: "Monthly/daily archive .zip URL (e.g. https://download.companieshouse.gov.uk/archive/Accounts_Monthly_Data-January2020.zip)"
         required: true
         type: string
       limit:
-        description: "Max inner ixbrl files to parse"
+        description: "Max inner iXBRL files to parse (0 = all)"
         required: false
         default: "200"
+        type: string
+      out:
+        description: "Optional output path (parquet or csv), e.g. out/fin_sample.parquet"
+        required: false
+        default: ""
         type: string
 
 jobs:
@@ -18,13 +23,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
       - name: Install deps
-        run: pip install ixbrlparse requests
-      - name: Run sampler
-        env:
-          LIMIT_FILES: ${{ github.event.inputs.limit }}
         run: |
-          python scripts/sample_ixbrl_month.py "${{ github.event.inputs.url }}"
+          python -m pip install --upgrade pip
+          pip install lxml pandas pyarrow requests
+
+      - name: Run diagnostics
+        env:
+          URL: ${{ github.event.inputs.url }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          OUT: ${{ github.event.inputs.out }}
+        run: |
+          set -e
+          echo "URL=$URL"
+          echo "LIMIT=$LIMIT"
+          echo "OUT=$OUT"
+          if [ -z "$OUT" ]; then
+            python scripts/ixbrl_bulk_parse_with_diagnostics.py --input "$URL" --max "$LIMIT"
+          else
+            python scripts/ixbrl_bulk_parse_with_diagnostics.py --input "$URL" --max "$LIMIT" --out "$OUT"
+          fi
+
+      - name: Upload artifact (if output was written)
+        if: ${{ github.event.inputs.out != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fin-sample
+          path: |
+            ${{ github.event.inputs.out }}
+            ${{ github.event.inputs.out }}.csv
+            ${{ github.event.inputs.out }}.parquet
+          if-no-files-found: ignore
