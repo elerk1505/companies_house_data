@@ -1,105 +1,54 @@
-name: Financials Bulk
+name: Financials Auto Bulk
 
 on:
   workflow_dispatch:
     inputs:
       year:
-        description: "Year (e.g., 2025)"
-        required: true
+        description: "Year (e.g. 2024)"
         type: number
+        required: true
       months_csv:
-        description: "Months CSV, e.g. 1,2,3"
+        description: "Comma-separated months (e.g. 1,2,3)"
+        type: string
         required: true
-        type: string
-      limit_files:
-        description: "Optional: stop after N inner iXBRL files per month"
-        required: false
-        type: number
-      max_workers:
-        description: "Optional: parser concurrency hint (default 8)"
-        required: false
-        type: number
-      cache:
-        description: "Optional cache dir for monthly ZIPs (e.g., _cache)"
-        required: false
-        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bulk-manual
+  cancel-in-progress: false
 
 jobs:
-  prep:
-    runs-on: ubuntu-latest
-    outputs:
-      months_matrix: ${{ steps.mk.outputs.months_matrix }}
-    steps:
-      - name: Make months matrix
-        id: mk
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import os, json
-          s = os.environ["MONTHS"]
-          arr = [int(x.strip()) for x in s.split(",") if x.strip()]
-          # matrix object like: { "month": [1,2,3] }
-          print("months_matrix=" + json.dumps({"month": arr}))
-          PY
-        env:
-          MONTHS: ${{ inputs.months_csv }}
-
   bulk:
-    needs: prep
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prep.outputs.months_matrix) }}
-
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # Cache the monthly ZIP so retries don't re-download
-      - name: Prep cache key
-        id: k
-        shell: bash
-        run: |
-          # Force month to string so linters don't complain
-          echo "key=ch-${{ inputs.year }}-${{ format('{0}', matrix.month) }}" >> "$GITHUB_OUTPUT"
-
-      - name: Cache CH monthly zips
-        if: ${{ inputs.cache != '' }}
-        uses: actions/cache@v4
-        with:
-          path: ${{ inputs.cache }}
-          key: ${{ steps.k.outputs.key }}
-
       - name: Install deps
-        shell: bash
         run: |
           python -m pip install -U pip pandas pyarrow requests beautifulsoup4 lxml ixbrlparse
 
-      - name: Bulk parse month
+      - name: Cache CH monthly zips
+        uses: actions/cache@v4
+        with:
+          path: _cache
+          key: ${{ format('ch-{0}-{1}', inputs.year, inputs.months_csv) }}
+
+      - name: Run bulk
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PYTHONPATH: ${{ github.workspace }}
-        shell: bash
         run: |
-          set -euo pipefail
-          YEAR="${{ inputs.year }}"
-          MONTH="${{ matrix.month }}"
-          LIMIT="${{ inputs.limit_files }}"
-          MAXW="${{ inputs.max_workers }}"
-          CACHE="${{ inputs.cache }}"
-
-          ARGS=()
-          if [[ -n "${LIMIT}" ]]; then ARGS+=("--limit-files" "${LIMIT}"); fi
-          if [[ -n "${MAXW}" ]]; then ARGS+=("--max-workers" "${MAXW}"); fi
-          if [[ -n "${CACHE}" ]]; then mkdir -p "${CACHE}"; ARGS+=("--cache-dir" "${CACHE}"); fi
-
-          echo "::group::Run bulk month ${YEAR}-${MONTH}"
+          mkdir -p _cache
           python -m scripts.ixbrl_bulk_parse \
-            --year "${YEAR}" \
-            --months "${MONTH}" \
-            "${ARGS[@]}"
-          echo "::endgroup::"
+            --year ${{ inputs.year }} \
+            --months "${{ inputs.months_csv }}" \
+            --max-workers 12 \
+            --cache-dir _cache
