@@ -1,0 +1,94 @@
+name: Financials Bulk Scheduled
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # every 4 hours
+  workflow_dispatch: {}     # allow manual run
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bulk-scheduled
+  cancel-in-progress: false
+
+jobs:
+  bulk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+      # Read or create the pointer (start at 2024-01)
+      - name: Read state
+        id: state
+        run: |
+          if [ ! -f .bulk_state.json ]; then
+            echo '{"year":2024,"month":1}' > .bulk_state.json
+          fi
+          YEAR=$(jq -r .year .bulk_state.json)
+          MONTH=$(jq -r .month .bulk_state.json)
+          echo "year=$YEAR"   >> "$GITHUB_OUTPUT"
+          echo "month=$MONTH" >> "$GITHUB_OUTPUT"
+          echo "Processing $YEAR-$MONTH"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip pandas pyarrow requests beautifulsoup4 lxml ixbrlparse
+
+      # Cache the monthly .zip so retries don't re-download
+      - name: Prep cache key
+        id: k
+        run: echo "key=ch-${{ steps.state.outputs.year }}-${{ steps.state.outputs.month }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache CH monthly zips
+        uses: actions/cache@v4
+        with:
+          path: _cache
+          key: ${{ steps.k.outputs.key }}
+
+      - name: Bulk parse month
+        env:
+          GITHUB_TOKEN: ${{ github.token }}         # uses repo's token
+          GH_REPO: ${{ github.repository }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          YEAR=${{ steps.state.outputs.year }}
+          MONTH=${{ steps.state.outputs.month }}
+          mkdir -p _cache
+          python -m scripts.ixbrl_bulk_parse \
+            --year "$YEAR" \
+            --months "$MONTH" \
+            --max-workers 12 \
+            --cache-dir _cache
+
+      - name: Advance pointer (Jan→Dec, then previous year)
+        run: |
+          YEAR=${{ steps.state.outputs.year }}
+          MONTH=${{ steps.state.outputs.month }}
+          if [ "$MONTH" -lt 12 ]; then
+            NEW_MONTH=$((MONTH+1))
+            NEW_YEAR=$YEAR
+          else
+            NEW_MONTH=1
+            NEW_YEAR=$((YEAR-1))
+          fi
+          echo "{\"year\":$NEW_YEAR,\"month\":$NEW_MONTH}" > .bulk_state.json
+          echo "Next run will process: $(cat .bulk_state.json)"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .bulk_state.json
+          git commit -m "Advance bulk pointer to $NEW_YEAR-$NEW_MONTH" || echo "No changes to commit"
+          git push
